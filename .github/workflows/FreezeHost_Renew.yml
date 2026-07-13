@@ -29,6 +29,10 @@ jobs:
     permissions:
       contents: write
       actions: write
+    env:
+      # 默认 false: 用 GitHub Actions 原生 IP (避免被 FreezeHost 当代理拉黑)
+      # 设为 true: 启用 WARP (如果你之前的设置好使可以打开)
+      ENABLE_WARP: ${{ vars.ENABLE_WARP || 'false' }}
 
     steps:
       - name: 确定使用哪个 Token
@@ -67,13 +71,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq bc
 
-      - name: 启用 WARP 网络
+      - name: 启用 WARP 网络（可选，若被 FreezeHost 拉黑则禁用此步骤）
+        if: ${{ env.ENABLE_WARP == 'true' }}
         uses: fscarmen/warp-on-actions@v1.3
         with:
           stack: dual
           mode: client
 
-      - name: 修复 DNS
+      - name: 修复 DNS & 验证出口 IP
         run: |
           echo "[INFO] 停用 systemd-resolved，直连 DNS..."
 
@@ -90,9 +95,9 @@ jobs:
           nslookup free.freezehost.pro 1.1.1.1 || echo "[WARN] 解析失败"
 
           echo ""
-          echo "[INFO] 当前出口 IP:"
+          echo "[INFO] 当前出口 IP (GitHub Actions 原生):"
           curl -s --max-time 10 https://api.ipify.org && echo
-          echo "[INFO] WARP Trace:"
+          echo "[INFO] Cloudflare Trace:"
           curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
 
       - name: 设置 Discord Token
