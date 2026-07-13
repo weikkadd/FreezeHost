@@ -203,13 +203,22 @@ def merge_screenshots(browser, buffers: list[bytes]) -> bytes | None:
         pg.close()
 
 def check_site_down(page) -> bool:
-    """Detect FreezeHost 'CONNECTION TO THE MANAGEMENT SERVICES LOST' or similar outage screens."""
+    """Detect FreezeHost 'CONNECTION TO THE MANAGEMENT SERVICES LOST' or similar outage screens.
+    兼容大小写: HTML 里是 'Connection to the Management Services Lost' (首字母大写)
+    """
     try:
         return page.evaluate("""() => {
             const body = document.body ? document.body.innerText : '';
-            if (body.includes('CONNECTION TO THE MANAGEMENT SERVICES LOST')) return true;
-            if (body.includes('Retrying in') && body.includes('Retry Now')) return true;
-            if (document.querySelector('button:has-text("Retry Now")')) return true;
+            const bodyLower = body.toLowerCase();
+            // 大小写不敏感匹配
+            if (bodyLower.includes('connection to the management services lost')) return true;
+            if (bodyLower.includes('retrying in') && bodyLower.includes('retry now')) return true;
+            if (bodyLower.includes('service unavailable')) return true;
+            // 检查 Retry Now 按钮 (大小写不敏感)
+            const retryBtn = document.querySelector('button');
+            if (retryBtn && retryBtn.innerText && retryBtn.innerText.toLowerCase().includes('retry now')) return true;
+            // 检查 OOPS 标题 (FreezeHost 错误页特征)
+            if (bodyLower.includes('oops') && bodyLower.includes('retry')) return true;
             return false;
         }""")
     except Exception:
@@ -280,30 +289,52 @@ def wait_for_site_ready(page) -> bool:
         page.wait_for_timeout(5000)
 
         if check_site_down(page):
-            log_warn(f"FreezeHost 后端服务不可用 (尝试 {attempt})")
+            log_warn(f"FreezeHost 后端服务不可用 (OOPS / Connection Lost, 尝试 {attempt})")
             take_screenshot(page, f"site-down-{attempt}")
 
-            # Try clicking the "Retry Now" button on the page itself
+            # 主动点 Retry Now 按钮触发重试 (FreezeHost 错误页有这个按钮)
             try:
-                retry_btn = page.locator('button:has-text("Retry Now")')
-                if retry_btn.is_visible():
-                    log_info("点击页面 Retry Now 按钮...")
-                    retry_btn.click()
-                    page.wait_for_timeout(10_000)
+                # 多组选择器找 Retry Now
+                for sel in ['button:has-text("Retry Now")', 'button:has-text("Retry")',
+                           'button[onclick*="reload"]', 'button:has-text("重试")']:
+                    try:
+                        retry_btn = page.locator(sel).first
+                        if retry_btn.is_visible(timeout=2000):
+                            log_info(f"点击 Retry Now 按钮 (选择器: {sel})...")
+                            retry_btn.click()
+                            page.wait_for_timeout(8000)  # 等待重试后页面加载
+                            if not check_site_down(page):
+                                log_info("站点恢复正常")
+                                break  # 跳出 for, 继续往下检查登录按钮
+                            else:
+                                log_warn("点 Retry 后还是 OOPS, 继续重试")
+                                break  # 跳出 for, 继续外层 while
+                    except Exception:
+                        continue
+            except Exception as e:
+                log_warn(f"点 Retry 异常: {e}")
+
+            # 主动 reload 也试一下
+            if check_site_down(page):
+                try:
+                    log_info("尝试 page.reload()...")
+                    page.reload(wait_until="domcontentloaded", timeout=20000)
+                    page.wait_for_timeout(5000)
                     if not check_site_down(page):
-                        log_info("站点恢复正常")
+                        log_info("reload 后站点恢复正常")
                         # 继续往下检查登录按钮
                     else:
                         if attempt < MAX_SITE_RETRIES:
+                            log_info(f"等待 {RETRY_WAIT // 1000} 秒后重试...")
                             page.wait_for_timeout(RETRY_WAIT)
                         continue
-            except Exception:
-                pass
+                except Exception as e:
+                    log_warn(f"reload 异常: {e}")
 
-            if attempt < MAX_SITE_RETRIES:
-                log_info(f"等待 {RETRY_WAIT // 1000} 秒后重试...")
-                page.wait_for_timeout(RETRY_WAIT)
-            continue
+            if check_site_down(page):
+                if attempt < MAX_SITE_RETRIES:
+                    page.wait_for_timeout(RETRY_WAIT)
+                continue
 
         # 1) 检测是否已登录 (跳过登录页)
         if is_already_logged_in(page):
