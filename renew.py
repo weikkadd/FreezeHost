@@ -658,28 +658,64 @@ def run():
                 log_info("已到达 Discord")
 
                 # ── 注入 Token ────────────────────────────────
-                # 旧方案：用 iframe.contentWindow.localStorage 注入，
-                #   但 Discord 页面的 CSP / sandbox 会让 contentWindow 为 null，导致抛错。
-                # 新方案：add_init_script 在每个页面加载前注入 localStorage，
-                #   不依赖 iframe，绕过 CSP，且对所有后续跳转也生效。
+                # 多策略注入 (按可靠性排序):
+                #   A. add_init_script (每个新页面加载前执行, 对所有跳转生效)
+                #   B. page.evaluate 直接执行 (当前页面立即生效)
+                #   C. context.add_cookies (备份, Discord token 不在 cookie, 此步可跳过)
+                # 注入后立即验证 localStorage.token 是否存在, 不存在则报错
+
+                # 策略 A: add_init_script
                 try:
+                    # 注意: Discord localStorage 的 token 值带双引号 (JSON 字符串)
+                    token_value = json.dumps(DISCORD_TOKEN)  # 自动加双引号
                     page.add_init_script(f"""() => {{
                         try {{
-                            localStorage.setItem('token', JSON.stringify({json.dumps(DISCORD_TOKEN)}));
+                            window.localStorage.setItem('token', '{token_value}');
                         }} catch (e) {{}}
                     }}""")
-                    log_info("Token init script 已注册")
+                    log_info("Token init script 已注册 (策略 A)")
                 except Exception as e:
-                    log_warn(f"add_init_script 注册失败，回退到 evaluate 注入: {e}")
-                    try:
-                        page.evaluate("""(token) => {
-                            try { localStorage.setItem('token', '"'+token+'"'); } catch(e) {}
-                        }""", DISCORD_TOKEN)
-                    except Exception as e2:
-                        log_error(f"evaluate 注入也失败: {e2}")
+                    log_warn(f"策略 A (add_init_script) 注册失败: {e}")
+
+                # 策略 B: page.evaluate 直接执行 (双保险, 立即生效)
+                try:
+                    result = page.evaluate("""(token) => {
+                        try {
+                            window.localStorage.setItem('token', JSON.stringify(token));
+                            return window.localStorage.getItem('token');
+                        } catch(e) {
+                            return 'ERROR: ' + e.message;
+                        }
+                    }""", DISCORD_TOKEN)
+                    if result and 'ERROR' not in str(result):
+                        log_info(f"策略 B (evaluate) 注入成功, localStorage.token 长度: {len(str(result))}")
+                    else:
+                        log_warn(f"策略 B (evaluate) 注入失败: {result}")
+                except Exception as e:
+                    log_warn(f"策略 B (evaluate) 异常: {e}")
+
+                # 验证注入是否真的生效
+                try:
+                    stored = page.evaluate("() => { try { return window.localStorage.getItem('token'); } catch(e) { return null; } }")
+                    if not stored:
+                        log_error("❌ Token 注入后 localStorage.token 为 null, 注入失败")
+                        buf = take_screenshot(page, "inject-failed")
+                        send_tg(
+                            f"用户：{display_name}\n"
+                            f"❌ Token 注入失败 (localStorage 无法写入)\n"
+                            f"可能原因: 浏览器策略限制 / Discord CSP 拦截\n"
+                            f"\nFreezeHost Auto Renew",
+                            buf,
+                        )
+                        raise RuntimeError("Token 注入失败, localStorage 写入无效")
+                    log_info(f"✅ Token 已写入 localStorage (长度 {len(stored)})")
+                except RuntimeError:
+                    raise
+                except Exception as e:
+                    log_warn(f"验证注入时异常: {e}")
 
                 page.reload(wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(5000)  # 等 SPA 渲染
 
                 # Token 失效检测: 不只看 URL, 还要看页面内容
                 # Discord login 页特征: URL 含 /login, 或页面含 "Welcome back" / "Log In" 文字
