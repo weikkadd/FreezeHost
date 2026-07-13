@@ -611,107 +611,59 @@ def run():
             locale="en-US",
             timezone_id="America/New_York",
         )
-        # 注入反检测脚本: 完整覆盖 FreezeHost 的 5 项检测
-        # 检测报告: navigator.webdriver, userAgent_headless, permissions_mismatch, WebGL
+        # 注入反检测脚本: 只保留必要的, 避免破坏 Discord SPA 渲染
+        # 之前的版本加了 WebGL/hardwareConcurrency/deviceMemory 等, 导致 Discord 白屏
+        # 精简后只处理 FreezeHost 实际检测的几项
         context.add_init_script("""
-            // 1. 隐藏 navigator.webdriver (最重要)
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            // 删除 webdriver 属性
-            delete navigator.__proto__.webdriver;
-
-            // 2. 伪造 navigator.plugins (headless 默认是 0)
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => {
-                    const plugins = [
-                        { name: 'Chrome PDF Plugin' },
-                        { name: 'Chrome PDF Viewer' },
-                        { name: 'Native Client' }
-                    ];
-                    plugins.refresh = () => {};
-                    plugins.item = (i) => plugins[i] || null;
-                    plugins.namedItem = (n) => plugins.find(p => p.name === n) || null;
-                    return plugins;
-                }
-            });
-
-            // 3. 伪造 navigator.mimeTypes (与 plugins 配套)
-            Object.defineProperty(navigator, 'mimeTypes', {
-                get: () => {
-                    const mimes = [
-                        { type: 'application/pdf', suffixes: 'pdf', description: '' },
-                        { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: '' },
-                        { type: 'application/x-nacl', suffixes: '', description: '' }
-                    ];
-                    mimes.item = (i) => mimes[i] || null;
-                    mimes.namedItem = (n) => mimes.find(m => m.type === n) || null;
-                    return mimes;
-                }
-            });
-
-            // 4. 伪造 navigator.languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en']
-            });
-
-            // 5. 修复 permissions API 不匹配
-            // webdriver_with_permissions_mismatch 检测点
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) =>
-                parameters.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission })
-                    : originalQuery(parameters);
-
-            // 6. 伪造 WebGL 渲染器 (headless 默认是 SwiftShader, 真实浏览器是 GPU)
-            const getParameter = WebGLRenderingContext.prototype.getParameter;
-            WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                if (parameter === 37445) return 'Intel Inc.';          // UNMASKED_VENDOR_WEBGL
-                if (parameter === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
-                return getParameter.call(this, parameter);
-            };
-            // WebGL2 也要处理
-            if (typeof WebGL2RenderingContext !== 'undefined') {
-                const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-                WebGL2RenderingContext.prototype.getParameter = function(parameter) {
-                    if (parameter === 37445) return 'Intel Inc.';
-                    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-                    return getParameter2.call(this, parameter);
-                };
-            }
-
-            // 7. 隐藏 chrome runtime (headless 没有, 普通浏览器有)
-            window.chrome = {
-                runtime: {},
-                loadTimes: () => {},
-                csi: () => {},
-                app: {},
-            };
-
-            // 8. 伪造 navigator.hardwareConcurrency (headless 默认通常是 4, 真实不一定)
-            Object.defineProperty(navigator, 'hardwareConcurrency', {
-                get: () => 8
-            });
-
-            // 9. 伪造 navigator.deviceMemory (headless 默认没这个属性)
-            Object.defineProperty(navigator, 'deviceMemory', {
-                get: () => 8
-            });
-
-            // 10. 伪造 navigator.connection (headless 默认没这个)
-            Object.defineProperty(navigator, 'connection', {
-                get: () => ({
-                    effectiveType: '4g',
-                    rtt: 50,
-                    downlink: 10,
-                    saveData: false
-                })
-            });
-
-            // 11. 修复 Notification.permission (与 permissions API 配套)
-            if (typeof Notification !== 'undefined') {
-                Object.defineProperty(Notification, 'permission', {
-                    get: () => 'default'
+            // 1. 隐藏 navigator.webdriver (最重要, FreezeHost 必检测项)
+            try {
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                    configurable: true
                 });
-            }
+            } catch(e) {}
+
+            // 2. 伪造 navigator.plugins (headless 默认 0, 真实浏览器 3+)
+            try {
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => {
+                        const arr = [
+                            { name: 'Chrome PDF Plugin' },
+                            { name: 'Chrome PDF Viewer' },
+                            { name: 'Native Client' }
+                        ];
+                        arr.refresh = () => {};
+                        arr.item = (i) => arr[i] || null;
+                        arr.namedItem = (n) => arr.find(p => p.name === n) || null;
+                        return arr;
+                    },
+                    configurable: true
+                });
+            } catch(e) {}
+
+            // 3. 伪造 navigator.languages
+            try {
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                    configurable: true
+                });
+            } catch(e) {}
+
+            // 4. 修复 permissions API (FreezeHost 检测 permissions_mismatch)
+            try {
+                const origQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
+                window.navigator.permissions.query = (parameters) =>
+                    parameters.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : origQuery(parameters);
+            } catch(e) {}
+
+            // 5. window.chrome (headless 默认没有, 真实有)
+            try {
+                if (!window.chrome) {
+                    window.chrome = { runtime: {} };
+                }
+            } catch(e) {}
         """)
         page = context.new_page()
         page.set_default_timeout(TIMEOUT)
@@ -820,7 +772,14 @@ def run():
                 except PlaywrightTimeout:
                     log_warn("等待 Discord domcontentloaded 超时")
 
-                page.wait_for_timeout(3000)  # 等 SPA 渲染 Authorize 按钮
+                # 等 networkidle 让 SPA 完全渲染 (Discord 页面较重, 需要 networkidle)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=20000)
+                except PlaywrightTimeout:
+                    log_warn("等待 Discord networkidle 超时")
+
+                page.wait_for_timeout(5000)  # 等 SPA 渲染 Authorize 按钮 (加长到 5s)
+                log_info(f"Discord 页面加载完成, URL: {page.url}")
 
                 # 检查是否需要点 Authorize 按钮
                 # Discord OAuth 授权页有 "Authorize" 按钮, 必须点击才能完成授权
