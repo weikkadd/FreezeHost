@@ -681,18 +681,42 @@ def run():
                 page.reload(wait_until="domcontentloaded")
                 page.wait_for_timeout(3000)
 
-                if re.search(r"discord\.com/login", page.url):
+                # Token 失效检测: 不只看 URL, 还要看页面内容
+                # Discord login 页特征: URL 含 /login, 或页面含 "Welcome back" / "Log In" 文字
+                current_url = page.url or ""
+                is_login_page = False
+                login_indicators = []
+
+                if re.search(r"discord\.com/login", current_url):
+                    is_login_page = True
+                    login_indicators.append(f"URL 含 /login: {current_url}")
+
+                # 检查页面 DOM 是否有登录表单特征
+                try:
+                    page_text = page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
+                    for keyword in ["Welcome back", "Log In", "Forgot your password", "Need an account", "Register"]:
+                        if keyword.lower() in page_text.lower():
+                            is_login_page = True
+                            login_indicators.append(f"页面含登录关键词: '{keyword}'")
+                            break
+                except Exception as e:
+                    log_warn(f"读取页面文本失败: {e}")
+
+                if is_login_page:
                     buf = take_screenshot(page, "token-failed")
+                    reason = "; ".join(login_indicators) if login_indicators else "未知"
                     send_tg(
                         f"用户：{display_name}\n"
-                        f"❌ Discord Token 已失效\n"
+                        f"❌ Discord Token 已失效 (或被 Discord 风控要求重新登录)\n"
+                        f"检测原因: {reason}\n"
                         f"请重新获取 Token 并更新 GitHub Secrets:\n"
                         f"  FREEZEHOST_DISCORD_TOKEN_{int(os.environ.get('TOKEN_NUM', '1'))}\n"
-                        f"教程: 浏览器 F12 → Network → 任意请求 → Headers → Authorization\n"
+                        f"教程: Discord 网页 F12 → Console → 粘贴:\n"
+                        f"  (webpackChunkdiscord_app.push([[''],{{}},e=>{{m=[];for(let c in e.c)m.push(e.c[c])}}]]),m).find(m=>m?.exports?.default?.getToken!==void 0).exports.default.getToken()\n"
                         f"\nFreezeHost Auto Renew",
                         buf,
                     )
-                    raise RuntimeError("Token 登录失败（Token 已失效，需更新 GitHub Secrets）")
+                    raise RuntimeError(f"Token 登录失败 (原因: {reason})")
 
                 log_info("Token 注入成功")
 
