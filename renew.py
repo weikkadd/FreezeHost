@@ -133,6 +133,11 @@ def send_tg(caption: str, image_bytes: bytes | None = None):
     if not TG_CHAT_ID or not TG_BOT_TOKEN:
         log_warn("TG 未配置，跳过推送")
         return
+    # 自动在通知末尾加上续期网站 URL (除非已经包含)
+    if "free.freezehost.pro" not in caption and "FreezeHost Auto Renew" in caption:
+        caption = caption.replace("FreezeHost Auto Renew", f"🌐 {BASE_URL}\nFreezeHost Auto Renew")
+    elif "free.freezehost.pro" not in caption and "FreezeHost Auto Renew" not in caption:
+        caption = caption.rstrip() + f"\n\n🌐 {BASE_URL}\nFreezeHost Auto Renew"
     try:
         if image_bytes:
             boundary = f"----Boundary{abs(hash(caption))}"
