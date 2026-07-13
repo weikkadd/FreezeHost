@@ -570,13 +570,18 @@ def run():
     # 启动浏览器 (可选 sing-box 代理, 复用 katabump 方案)
     # 关键: 用 headless=False 绕过 FreezeHost 的 headless 检测
     # 在 GitHub Actions 里配合 xvfb-run 使用, 提供虚拟显示器
+    # 重要: 即便 headless=False, Playwright 在某些环境下仍会发 HeadlessChrome UA
+    # 必须强制覆盖 UA + 在 init_script 里硬改 navigator.userAgent
+    REAL_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
     launch_kwargs = {
         "headless": False,  # 必须非 headless, 否则被 FreezeHost 检测拉黑
+        "channel": "chrome",  # 用系统 chrome 而不是 chromium (避免 HeadlessChrome 标志)
         "args": [
             "--no-sandbox",
             "--disable-blink-features=AutomationControlled",  # 隐藏 navigator.webdriver
             "--disable-dev-shm-usage",
             "--window-size=1280,753",
+            f"--user-agent={REAL_UA}",  # 启动参数也指定 UA
         ],
     }
     if IS_PROXY and PROXY_SERVER:
@@ -602,68 +607,89 @@ def run():
     }
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(**launch_kwargs)
+        # 尝试用 chrome channel, 失败回退到 chromium
+        try:
+            browser = pw.chromium.launch(**launch_kwargs)
+        except Exception as e:
+            log_warn(f"用 chrome channel 启动失败: {e}, 回退到 chromium")
+            launch_kwargs.pop("channel", None)
+            browser = pw.chromium.launch(**launch_kwargs)
         # 用 storage_state 创建 context, 这样 discord.com 的 localStorage 会预写入 token
         context = browser.new_context(
             viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
             storage_state=storage_state,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            user_agent=REAL_UA,  # 强制 UA
             locale="en-US",
             timezone_id="America/New_York",
         )
-        # 注入反检测脚本: 只保留必要的, 避免破坏 Discord SPA 渲染
-        # 之前的版本加了 WebGL/hardwareConcurrency/deviceMemory 等, 导致 Discord 白屏
-        # 精简后只处理 FreezeHost 实际检测的几项
-        context.add_init_script("""
-            // 1. 隐藏 navigator.webdriver (最重要, FreezeHost 必检测项)
-            try {
-                Object.defineProperty(navigator, 'webdriver', {
+        # 注入反检测脚本: 强制覆盖 UA + 隐藏 webdriver
+        # 关键: FreezeHost 检测 userAgent_headless, 必须把 HeadlessChrome 改成 Chrome
+        context.add_init_script(f"""
+            // 1. 强制覆盖 navigator.userAgent (最关键, FreezeHead 检测 userAgent_headless)
+            try {{
+                Object.defineProperty(navigator, 'userAgent', {{
+                    get: () => '{REAL_UA}',
+                    configurable: true
+                }});
+            }} catch(e) {{}}
+
+            // 2. 强制覆盖 navigator.appVersion (与 UA 配套, 也会暴露 HeadlessChrome)
+            try {{
+                Object.defineProperty(navigator, 'appVersion', {{
+                    get: () => '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+                    configurable: true
+                }});
+            }} catch(e) {{}}
+
+            // 3. 隐藏 navigator.webdriver (FreezeHost 必检测项)
+            try {{
+                Object.defineProperty(navigator, 'webdriver', {{
                     get: () => undefined,
                     configurable: true
-                });
-            } catch(e) {}
+                }});
+            }} catch(e) {{}}
 
-            // 2. 伪造 navigator.plugins (headless 默认 0, 真实浏览器 3+)
-            try {
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => {
+            // 4. 伪造 navigator.plugins (headless 默认 0)
+            try {{
+                Object.defineProperty(navigator, 'plugins', {{
+                    get: () => {{
                         const arr = [
-                            { name: 'Chrome PDF Plugin' },
-                            { name: 'Chrome PDF Viewer' },
-                            { name: 'Native Client' }
+                            {{ name: 'Chrome PDF Plugin' }},
+                            {{ name: 'Chrome PDF Viewer' }},
+                            {{ name: 'Native Client' }}
                         ];
-                        arr.refresh = () => {};
+                        arr.refresh = () => {{}};
                         arr.item = (i) => arr[i] || null;
                         arr.namedItem = (n) => arr.find(p => p.name === n) || null;
                         return arr;
-                    },
+                    }},
                     configurable: true
-                });
-            } catch(e) {}
+                }});
+            }} catch(e) {{}}
 
-            // 3. 伪造 navigator.languages
-            try {
-                Object.defineProperty(navigator, 'languages', {
+            // 5. 伪造 navigator.languages
+            try {{
+                Object.defineProperty(navigator, 'languages', {{
                     get: () => ['en-US', 'en'],
                     configurable: true
-                });
-            } catch(e) {}
+                }});
+            }} catch(e) {{}}
 
-            // 4. 修复 permissions API (FreezeHost 检测 permissions_mismatch)
-            try {
+            // 6. 修复 permissions API (FreezeHost 检测 permissions_mismatch)
+            try {{
                 const origQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
                 window.navigator.permissions.query = (parameters) =>
                     parameters.name === 'notifications'
-                        ? Promise.resolve({ state: Notification.permission })
+                        ? Promise.resolve({{ state: Notification.permission }})
                         : origQuery(parameters);
-            } catch(e) {}
+            }} catch(e) {{}}
 
-            // 5. window.chrome (headless 默认没有, 真实有)
-            try {
-                if (!window.chrome) {
-                    window.chrome = { runtime: {} };
-                }
-            } catch(e) {}
+            // 7. window.chrome (headless 默认没有)
+            try {{
+                if (!window.chrome) {{
+                    window.chrome = {{ runtime: {{}} }};
+                }}
+            }} catch(e) {{}}
         """)
         page = context.new_page()
         page.set_default_timeout(TIMEOUT)

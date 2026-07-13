@@ -62,6 +62,12 @@ jobs:
 
       - name: 安装依赖
         run: |
+          # 安装真正的 Google Chrome (不是 Playwright 自带的 chromium)
+          # 因为 chromium 即便 headless=False 也会发 HeadlessChrome UA, 被 FreezeHost 检测
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+          google-chrome --version
+
           pip install playwright
           playwright install chromium --with-deps
           sudo apt-get update
