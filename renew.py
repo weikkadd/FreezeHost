@@ -406,7 +406,42 @@ def handle_oauth_page(page):
                 continue
         page.wait_for_timeout(1500)
 
+def safe_goto(page, url, timeout=30000, wait_until="domcontentloaded"):
+    """安全的 page.goto 包装: 容错处理 ERR_ABORTED 和导航中断
+    FreezeHost 改版后, 直接 goto /dashboard 可能被前端重定向中断
+    改用 domcontentloaded 而不是 networkidle, 并捕获异常继续执行
+    """
+    try:
+        page.goto(url, wait_until=wait_until, timeout=timeout)
+        return True
+    except PlaywrightTimeout:
+        log_warn(f"goto 超时: {url}")
+        return False
+    except Exception as e:
+        err_str = str(e)
+        # ERR_ABORTED 通常是前端重定向导致的, 不算真错误
+        if "ERR_ABORTED" in err_str or "aborted" in err_str.lower():
+            log_info(f"goto 被前端重定向中断 (ERR_ABORTED, 通常正常): {url}")
+            page.wait_for_timeout(3000)  # 等重定向完成
+            return True
+        log_warn(f"goto 异常: {url} - {e}")
+        return False
+
+
 def discover_server_ids(page) -> list[str]:
+    """发现服务器列表 - 兼容 FreezeHost 改版
+    之前用 page.goto(BASE_URL + '/dashboard', wait_until='networkidle')
+    FreezeHost 改版后 /dashboard 可能重定向到 / 或其他路径, networkidle 永远等不到
+    改用 safe_goto + 多路径兜底
+    """
+    # 可能的 dashboard 路径, 按优先级尝试
+    dashboard_paths = [
+        f"{BASE_URL}/dashboard",
+        f"{BASE_URL}/",
+        f"{BASE_URL}/servers",
+        f"{BASE_URL}/home",
+    ]
+
     for attempt in range(3):
         captured: set[str] = set()
 
@@ -418,23 +453,74 @@ def discover_server_ids(page) -> list[str]:
         page.on("request", on_req)
         if attempt == 0:
             log_info("加载 Dashboard 发现服务器...")
-            page.goto(f"{BASE_URL}/dashboard", wait_until="networkidle")
+            # 尝试多个可能的 dashboard 路径
+            for path in dashboard_paths:
+                log_info(f"尝试打开: {path}")
+                if safe_goto(page, path, timeout=20000):
+                    page.wait_for_timeout(3000)
+                    current_url = page.url
+                    log_info(f"当前 URL: {current_url}")
+                    # 如果没被重定向到 login, 说明路径有效
+                    if "/login" not in current_url and "discord.com" not in current_url:
+                        log_info(f"路径有效: {path}")
+                        break
         else:
-            log_info(f"第 {attempt+1} 次重试...")
-            page.reload(wait_until="networkidle")
+            log_info(f"第 {attempt+1} 次重试 (reload)...")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=20000)
+            except Exception as e:
+                log_warn(f"reload 异常: {e}")
+                # reload 失败就重新 goto
+                safe_goto(page, f"{BASE_URL}/", timeout=20000)
 
         page.wait_for_timeout(5000)
         page.remove_listener("request", on_req)
 
+        # 多种方式提取服务器 ID (兼容 FreezeHost 改版)
         js_ids = page.evaluate(r"""() => {
             const ids = [];
-            if (typeof serverData !== 'undefined' && Array.isArray(serverData))
-                serverData.forEach(s => { if (s.identifier) ids.push(s.identifier); });
-            if (!ids.length) document.querySelectorAll('script:not([src])').forEach(sc => {
-                for (const m of sc.textContent.matchAll(/identifier:\s*["']([a-f0-9]{6,})["']/gi))
-                    ids.push(m[1]);
-            });
-            return ids;
+
+            // 方式1: 全局 serverData 变量
+            try {
+                if (typeof serverData !== 'undefined' && Array.isArray(serverData))
+                    serverData.forEach(s => { if (s.identifier) ids.push(s.identifier); });
+            } catch(e) {}
+
+            // 方式2: 从 script 标签内容提取 identifier
+            if (!ids.length) {
+                document.querySelectorAll('script:not([src])').forEach(sc => {
+                    try {
+                        for (const m of sc.textContent.matchAll(/identifier:\s*["']([a-f0-9]{6,})["']/gi))
+                            ids.push(m[1]);
+                    } catch(e) {}
+                });
+            }
+
+            // 方式3: 从 a[href*="server-console"] 链接提取
+            if (!ids.length) {
+                document.querySelectorAll('a[href*="server-console?id="]').forEach(a => {
+                    const m = a.href.match(/id=([a-f0-9]{6,})/i);
+                    if (m) ids.push(m[1]);
+                });
+            }
+
+            // 方式4: 从 a[href*="server/"] 链接提取
+            if (!ids.length) {
+                document.querySelectorAll('a[href*="/server/"]').forEach(a => {
+                    const m = a.href.match(/\/server\/([a-f0-9]{6,})/i);
+                    if (m) ids.push(m[1]);
+                });
+            }
+
+            // 方式5: 从按钮 data-id / data-server-id 属性提取
+            if (!ids.length) {
+                document.querySelectorAll('[data-server-id], [data-id]').forEach(el => {
+                    const v = el.getAttribute('data-server-id') || el.getAttribute('data-id');
+                    if (v && /^[a-f0-9]{6,}$/i.test(v)) ids.push(v);
+                });
+            }
+
+            return [...new Set(ids)];
         }""")
 
         all_ids = set(js_ids or []) | (captured if not js_ids else set())
@@ -446,7 +532,7 @@ def discover_server_ids(page) -> list[str]:
             log_info(f"发现 {len(all_ids)} 台服务器")
             return sorted(all_ids)
 
-        log_warn(f"第 {attempt+1} 次未发现服务器")
+        log_warn(f"第 {attempt+1} 次未发现服务器, 当前 URL: {page.url}")
         take_screenshot(page, f"dashboard-empty-{attempt+1}")
         if attempt < 2:
             page.wait_for_timeout(3000)
@@ -461,7 +547,7 @@ def process_server(page, server_id: str) -> dict:
 
     log_info(f"[{server_id}] 开始处理")
     try:
-        page.goto(server_url, wait_until="networkidle")
+        safe_goto(page, server_url, timeout=30000)
         page.wait_for_timeout(3000)
 
         status_text = page.evaluate("""() => {
@@ -535,7 +621,7 @@ def process_server(page, server_id: str) -> dict:
         if "success=RENEWED" in url:
             log_info(f"[{server_id}] 续期成功！")
             try:
-                page.goto(server_url, wait_until="networkidle")
+                safe_goto(page, server_url, timeout=30000)
                 page.wait_for_timeout(3000)
                 after_text = page.evaluate("""() => {
                     const el = document.getElementById('renewal-status-console');
@@ -728,10 +814,10 @@ def run():
             if is_already_logged_in(page):
                 log_info(f"已是登录态, 跳过 OAuth 流程, 当前 URL: {page.url}")
                 skipped_oauth = True
-                # 跳到 dashboard 发现服务器
-                if "/dashboard" not in page.url:
-                    page.goto(f"{BASE_URL}/dashboard", wait_until="networkidle")
-                    page.wait_for_timeout(3000)
+                # 已登录态, 不强制 goto dashboard (FreezeHost 可能改了路径)
+                # discover_server_ids 会自己尝试多个路径
+                if "/dashboard" not in page.url and "/server" not in page.url:
+                    log_info("当前不在 dashboard, discover_server_ids 会自动尝试多个路径")
             else:
                 # ── 登录 ─────────────────────────────────────
                 # 用 find_login_button 找到的 locator 点击, 不再硬编码选择器
