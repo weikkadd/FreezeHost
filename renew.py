@@ -694,179 +694,95 @@ def run():
                     )
                     raise RuntimeError(f"未跳转到 Discord, 当前 URL: {current_url}")
 
-                # ── Token 已通过 storage_state 预加载, 只需验证 ───
-                # storage_state 在浏览器启动时就写入了 localStorage, 跳转到 discord.com 后应能读到
-                # 关键: 必须等页面真正加载完, 否则 window.localStorage 是 undefined
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=15000)
-                except PlaywrightTimeout:
-                    log_warn("等待 domcontentloaded 超时, 继续尝试")
+                # ── 关键: OAuth 自动完成, 等待跳回 FreezeHost ──
+                # 流程: Discord OAuth → 自动跳转 free.freezehost.pro/submitlogin?code=... → 自动跳 /dashboard
+                # storage_state 已经预加载 Token 到 discord.com 的 localStorage, Discord 会自动登录并完成 OAuth
+                # 我们只需等待整个流程完成, 不要在中间页面上做任何 evaluate (会破坏 FreezeHost 的 callback 处理)
 
-                # 等 window.localStorage 可用 (Discord SPA 早期 localStorage 是 undefined)
+                # 等 Discord 处理完 OAuth, 跳回 free.freezehost.pro
+                # 可能跳到 /submitlogin 或 /callback 或直接 /dashboard
                 try:
-                    page.wait_for_function(
-                        "() => { try { return typeof window.localStorage !== 'undefined' && window.localStorage !== null; } catch(e) { return false; } }",
-                        timeout=15000,
+                    page.wait_for_url(
+                        lambda u: "free.freezehost.pro" in u,
+                        timeout=30000,
                     )
-                    log_info("localStorage 已可用")
+                    log_info(f"已跳回 FreezeHost: {page.url}")
                 except PlaywrightTimeout:
-                    log_warn("等待 localStorage 可用超时, 继续尝试读取")
-
-                page.wait_for_timeout(2000)  # 额外缓冲
-                log_info(f"当前 URL (注入前): {page.url}")
-
-                # 验证 localStorage.token 是否存在
-                try:
-                    stored = page.evaluate("""() => {
-                        try {
-                            if (typeof window.localStorage === 'undefined' || !window.localStorage) {
-                                return 'ERROR: localStorage is undefined';
-                            }
-                            return window.localStorage.getItem('token');
-                        } catch(e) {
-                            return 'ERROR: ' + e.message;
-                        }
-                    }""")
-                    if not stored or 'ERROR' in str(stored):
-                        log_error(f"❌ Token 未在 localStorage 中找到: {stored}")
-                        # 如果 storage_state 没生效, 尝试手动注入作为兜底
-                        log_info("尝试手动注入 Token 作为兜底...")
-                        try:
-                            page.evaluate("""(token) => {
-                                try { window.localStorage.setItem('token', JSON.stringify(token)); } catch(e) {}
-                            }""", DISCORD_TOKEN)
-                            page.wait_for_timeout(1000)
-                            stored = page.evaluate("() => { try { return window.localStorage.getItem('token'); } catch(e) { return null; } }")
-                            if stored:
-                                log_info(f"✅ 手动注入成功, token 长度: {len(stored)}")
-                            else:
-                                log_error("手动注入也失败")
-                        except Exception as e:
-                            log_error(f"手动注入异常: {e}")
-
-                        if not stored or 'ERROR' in str(stored):
-                            buf = take_screenshot(page, "inject-failed")
-                            send_tg(
-                                f"用户：{display_name}\n"
-                                f"❌ Token 注入失败 (storage_state + 手动注入都失败)\n"
-                                f"localStorage.token: {stored}\n"
-                                f"当前 URL: {page.url}\n"
-                                f"\nFreezeHost Auto Renew",
-                                buf,
-                            )
-                            raise RuntimeError(f"Token 注入失败, localStorage.token = {stored}")
-                    log_info(f"✅ Token 已在 localStorage 中 (长度 {len(stored)})")
-                except RuntimeError:
-                    raise
-                except Exception as e:
-                    log_warn(f"验证注入时异常: {e}")
-
-                page.reload(wait_until="domcontentloaded")
-                page.wait_for_timeout(5000)  # 等 SPA 渲染
-
-                # Token 失效检测: 不只看 URL, 还要看页面内容
-                # Discord login 页特征: URL 含 /login, 或页面含 "Welcome back" / "Log In" 文字
-                current_url = page.url or ""
-                is_login_page = False
-                login_indicators = []
-
-                if re.search(r"discord\.com/login", current_url):
-                    is_login_page = True
-                    login_indicators.append(f"URL 含 /login: {current_url}")
-
-                # 检查页面 DOM 是否有登录表单特征
-                try:
-                    page_text = page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : ''")
-                    for keyword in ["Welcome back", "Log In", "Forgot your password", "Need an account", "Register"]:
-                        if keyword.lower() in page_text.lower():
-                            is_login_page = True
-                            login_indicators.append(f"页面含登录关键词: '{keyword}'")
-                            break
-                except Exception as e:
-                    log_warn(f"读取页面文本失败: {e}")
-
-                if is_login_page:
-                    buf = take_screenshot(page, "token-failed")
-                    reason = "; ".join(login_indicators) if login_indicators else "未知"
-                    send_tg(
-                        f"用户：{display_name}\n"
-                        f"❌ Discord Token 已失效 (或被 Discord 风控要求重新登录)\n"
-                        f"检测原因: {reason}\n"
-                        f"请重新获取 Token 并更新 GitHub Secrets:\n"
-                        f"  FREEZEHOST_DISCORD_TOKEN_{int(os.environ.get('TOKEN_NUM', '1'))}\n"
-                        f"教程: Discord 网页 F12 → Console → 粘贴:\n"
-                        f"  (webpackChunkdiscord_app.push([[''],{{}},e=>{{m=[];for(let c in e.c)m.push(e.c[c])}}]]),m).find(m=>m?.exports?.default?.getToken!==void 0).exports.default.getToken()\n"
-                        f"\nFreezeHost Auto Renew",
-                        buf,
-                    )
-                    raise RuntimeError(f"Token 登录失败 (原因: {reason})")
-
-                log_info("Token 注入成功")
-
-                # ── OAuth ─────────────────────────────────────
-                try:
-                    page.wait_for_url(re.compile(r"discord\.com/oauth2/authorize"), timeout=6000)
-                    page.wait_for_timeout(2000)
+                    # 还在 Discord, 检查是否需要点 Authorize 按钮
                     if "discord.com" in page.url:
-                        handle_oauth_page(page)
-                    if "discord.com" in page.url:
+                        log_warn(f"还在 Discord, 尝试处理 OAuth 授权页: {page.url}")
                         try:
-                            page.wait_for_url(re.compile(r"free\.freezehost\.pro"), timeout=20000)
+                            page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        except PlaywrightTimeout:
+                            pass
+                        # 检查是否有 Authorize 按钮
+                        try:
+                            for sel in ['button:has-text("Authorize")', 'button[type="submit"]',
+                                       'div[class*="footer"] button', 'button[class*="primary"]']:
+                                btn = page.locator(sel).last
+                                if btn.is_visible(timeout=2000):
+                                    text = btn.inner_text().strip()
+                                    if any(k in text.lower() for k in ("authorize", "授权", "accept")):
+                                        log_info(f"点击 OAuth 授权按钮: {text}")
+                                        btn.click()
+                                        break
+                        except Exception:
+                            pass
+                        # 再等跳转
+                        try:
+                            page.wait_for_url(lambda u: "free.freezehost.pro" in u, timeout=20000)
+                            log_info(f"OAuth 后跳回 FreezeHost: {page.url}")
                         except PlaywrightTimeout:
                             buf = take_screenshot(page, "oauth-stuck")
                             send_tg(
                                 f"用户：{display_name}\n"
-                                f"❌ OAuth 授权页卡住，未能跳转回 FreezeHost\n"
-                                f"可能原因: Discord OAuth 页面 DOM 改版 / Token 权限不足 / 网络问题\n"
-                                f"建议: 手动登录一次 https://free.freezehost.pro 完成授权后重试\n"
+                                f"❌ OAuth 完成后未跳回 FreezeHost\n"
+                                f"当前 URL: {page.url}\n"
                                 f"\nFreezeHost Auto Renew",
                                 buf,
                             )
-                            raise RuntimeError("OAuth 未跳转（已发截图供人工排查）")
-                except PlaywrightTimeout:
-                    if "discord.com" in page.url:
-                        buf = take_screenshot(page, "oauth-timeout")
-                        send_tg(
-                            f"用户：{display_name}\n"
-                            f"❌ OAuth 等待 authorize 页超时\n"
-                            f"当前 URL: {page.url}\n"
-                            f"\nFreezeHost Auto Renew",
-                            buf,
-                        )
-                        raise RuntimeError("OAuth 超时（已发截图）")
+                            raise RuntimeError(f"OAuth 后未跳回 FreezeHost, URL: {page.url}")
 
-            # ── Dashboard ─────────────────────────────────
-            # OAuth 完成后, FreezeHost 会跳转到 /submitlogin?code=... 处理 callback
-            # 然后自动跳转到 /dashboard, 也可能直接到 /dashboard
-            if not skipped_oauth:
-                # 第一步: 等 FreezeHost 的 callback 路径 (/submitlogin 或 /callback 或 /dashboard)
-                try:
-                    page.wait_for_url(
-                        lambda u: "/submitlogin" in u or "/callback" in u or "/dashboard" in u,
-                        timeout=15000,
-                    )
-                    log_info(f"已回到 FreezeHost: {page.url}")
-                except PlaywrightTimeout:
-                    log_warn(f"未检测到 FreezeHost callback URL, 当前 URL: {page.url}")
-
-                # 第二步: 如果在 callback 中间页, 等它跳到 /dashboard
-                if "/submitlogin" in page.url or "/callback" in page.url:
-                    log_info("等待 FreezeHost 处理 callback 并跳转到 dashboard...")
+                # 已回到 FreezeHost, 等待 /submitlogin 自动跳到 /dashboard
+                # 不要在 /submitlogin 页面做 evaluate (会破坏 callback 处理)
+                if "/dashboard" not in page.url:
+                    log_info(f"等待自动跳转到 /dashboard, 当前: {page.url}")
                     try:
-                        page.wait_for_url(lambda u: "/dashboard" in u, timeout=20000)
+                        page.wait_for_url(
+                            lambda u: "/dashboard" in u,
+                            timeout=30000,
+                        )
                         log_info(f"已到达 Dashboard: {page.url}")
                     except PlaywrightTimeout:
-                        # 强制跳转到 dashboard
-                        log_warn(f"callback 未自动跳转, 强制打开 dashboard, 当前 URL: {page.url}")
-                        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded")
-                        page.wait_for_timeout(3000)
+                        # /submitlogin 没自动跳, 直接 goto /dashboard
+                        # 注意: 必须先等几秒让 FreezeHost 后端处理完 callback 建立session
+                        log_warn(f"callback 未自动跳转, 等 5s 后强制打开 dashboard, 当前: {page.url}")
+                        page.wait_for_timeout(5000)
+                        try:
+                            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=30000)
+                            page.wait_for_timeout(3000)
+                            log_info(f"强制打开 dashboard 后 URL: {page.url}")
+                        except PlaywrightTimeout:
+                            log_warn(f"强制打开 dashboard 超时, 当前: {page.url}")
 
-                # 第三步: 最终检查
+                # 最终检查是否到 dashboard
                 if "/dashboard" not in page.url:
-                    # 最后兜底: 直接打开 dashboard
-                    log_warn(f"未到 dashboard, 强制打开. 当前 URL: {page.url}")
-                    page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000)
+                    buf = take_screenshot(page, "not-dashboard")
+                    send_tg(
+                        f"用户：{display_name}\n"
+                        f"❌ 未到达 Dashboard\n"
+                        f"当前 URL: {page.url}\n"
+                        f"\nFreezeHost Auto Renew",
+                        buf,
+                    )
+                    raise RuntimeError(f"未到达 Dashboard, URL: {page.url}")
+
+                # 等 dashboard 完全渲染
+                try:
+                    page.wait_for_load_state("networkidle", timeout=30000)
+                except PlaywrightTimeout:
+                    log_warn("dashboard networkidle 超时, 继续")
+                page.wait_for_timeout(3000)
 
             log_info("登录成功")
 
