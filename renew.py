@@ -1174,9 +1174,12 @@ def run():
             # ── TG 推送（完整信息） ──────────────────────
             lines = []
             for r in results:
-                s = f"服务器: {r['server_id']} | {r['emoji']}{r['status_label']}"
+                sid = r['server_id']
+                server_url = f"{BASE_URL}/server-console?id={sid}"
+                s = f"服务器: {sid} | {r['emoji']}{r['status_label']}"
                 if r["detail"]:
                     s += f" {r['detail']}"
+                s += f"\n🌐 {server_url}"
                 lines.append(s)
 
             send_tg("\n".join([f"用户：{display_name}", *lines, "", "FreezeHost Auto Renew"]), final_img)
