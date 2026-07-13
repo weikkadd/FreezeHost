@@ -203,48 +203,59 @@ def merge_screenshots(browser, buffers: list[bytes]) -> bytes | None:
         pg.close()
 
 def check_site_down(page) -> bool:
-    """Detect FreezeHost 'CONNECTION TO THE MANAGEMENT SERVICES LOST' or similar outage screens.
-    多种检测方式兜底:
-    1. innerText (渲染后的文本)
-    2. textContent (所有文本, 包括隐藏元素)
-    3. title 标签
-    4. page.locator 直接找元素
+    """检测 FreezeHost 后端故障页 - 直接读 page.content() (HTML 源码)
+    比 innerText / locator 都可靠, 不依赖 JS 渲染时机
+
+    检测的故障页特征:
+    - OOPS / Connection to the Management Services Lost
+    - 502 Bad Gateway / 503 Service Unavailable / 504 Gateway Timeout
+    - Service Unavailable
+    - Cloudflare 错误页
     """
-    # 方式 1: 用 page.locator 找 OOPS / Retry Now 元素 (最可靠)
     try:
-        for sel in ['h1:has-text("OOPS")', 'button:has-text("Retry Now")',
-                   'p:has-text("Management Services Lost")',
-                   'p:has-text("management services lost")',
-                   'h1:has-text("Oops")']:
-            try:
-                if page.locator(sel).first.is_visible(timeout=500):
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
+        html = page.content() or ""
+        html_lower = html.lower()
 
-    # 方式 2: 用 JavaScript 读 innerText + textContent + title
-    try:
-        result = page.evaluate("""() => {
-            const body = document.body;
-            const innerText = body ? body.innerText : '';
-            const textContent = body ? body.textContent : '';
-            const title = document.title || '';
-            const all = (innerText + ' ' + textContent + ' ' + title).toLowerCase();
-            // 大小写不敏感匹配多种错误页特征
-            if (all.includes('connection to the management services lost')) return true;
-            if (all.includes('retrying in') && all.includes('retry now')) return true;
-            if (all.includes('service unavailable')) return true;
-            if (all.includes('oops') && all.includes('retry')) return true;
-            return false;
-        }""")
-        if result:
+        # FreezeHost 自定义错误页
+        if "connection to the management services lost" in html_lower:
             return True
-    except Exception:
-        pass
+        if "oops" in html_lower and "retry now" in html_lower:
+            return True
+        if "service unavailable" in html_lower:
+            return True
 
-    return False
+        # HTTP 标准错误页
+        if "502 bad gateway" in html_lower:
+            return True
+        if "503 service unavailable" in html_lower:
+            return True
+        if "504 gateway time-out" in html_lower or "504 gateway timeout" in html_lower:
+            return True
+        if "500 internal server error" in html_lower:
+            return True
+
+        # Cloudflare 错误页
+        if "cloudflare" in html_lower and "error" in html_lower:
+            return True
+        if "cf-ray" in html_lower and ("error" in html_lower or "sorry" in html_lower):
+            return True
+
+        # 标题检测
+        if "<title>" in html_lower:
+            import re as _re
+            title_match = _re.search(r'<title[^>]*>([^<]+)</title>', html, _re.IGNORECASE)
+            if title_match:
+                title = title_match.group(1).lower()
+                if "service unavailable" in title:
+                    return True
+                if "502" in title or "503" in title or "504" in title:
+                    return True
+                if "error" in title and "freezehost" not in title:
+                    return True
+
+        return False
+    except Exception:
+        return False
 
 
 # 多组选择器: FreezeHost 可能改版, 不再只用 span.text-lg
@@ -294,6 +305,42 @@ def is_already_logged_in(page) -> bool:
     return False
 
 
+def diagnose_site_down(page) -> str:
+    """诊断具体故障原因, 返回人类可读的字符串"""
+    try:
+        html = page.content() or ""
+        html_lower = html.lower()
+
+        if "502 bad gateway" in html_lower:
+            return "502 Bad Gateway (FreezeHost 后端网关故障)"
+        if "503 service unavailable" in html_lower:
+            return "503 Service Unavailable (FreezeHost 后端不可用)"
+        if "504 gateway time-out" in html_lower or "504 gateway timeout" in html_lower:
+            return "504 Gateway Timeout (FreezeHost 后端超时)"
+        if "500 internal server error" in html_lower:
+            return "500 Internal Server Error (FreezeHost 后端错误)"
+        if "connection to the management services lost" in html_lower:
+            return "Connection to Management Services Lost (FreezeHost 管理服务异常)"
+        if "oops" in html_lower and "retry now" in html_lower:
+            return "OOPS 错误页 (FreezeHost 后端故障)"
+        if "service unavailable" in html_lower:
+            return "Service Unavailable (FreezeHost 服务不可用)"
+        if "cloudflare" in html_lower and "error" in html_lower:
+            return "Cloudflare 错误页 (CDN 层故障)"
+        if "cf-ray" in html_lower and ("error" in html_lower or "sorry" in html_lower):
+            return "Cloudflare 拦截页 (可能被风控)"
+
+        # 标题检测
+        import re as _re
+        title_match = _re.search(r'<title[^>]*>([^<]+)</title>', html, _re.IGNORECASE)
+        if title_match:
+            return f"标题异常: {title_match.group(1)}"
+
+        return "未知故障"
+    except Exception as e:
+        return f"诊断异常: {e}"
+
+
 def wait_for_site_ready(page) -> bool:
     """Try loading FreezeHost up to MAX_SITE_RETRIES times, handling outage screens.
     Returns True if site became available AND login button is visible OR already logged in."""
@@ -311,7 +358,9 @@ def wait_for_site_ready(page) -> bool:
         page.wait_for_timeout(5000)
 
         if check_site_down(page):
-            log_warn(f"FreezeHost 后端服务不可用 (OOPS / Connection Lost, 尝试 {attempt})")
+            # 诊断具体故障原因并打印
+            reason = diagnose_site_down(page)
+            log_warn(f"❌ FreezeHost 后端故障 (尝试 {attempt}/{MAX_SITE_RETRIES}): {reason}")
             take_screenshot(page, f"site-down-{attempt}")
 
             # 主动点 Retry Now 按钮触发重试 (FreezeHost 错误页有这个按钮)
@@ -850,12 +899,15 @@ def run():
             log_info("打开 FreezeHost 登录页")
             if not wait_for_site_ready(page):
                 buf = take_screenshot(page, "site-down-final")
+                # 诊断最后一次的故障原因
+                final_reason = diagnose_site_down(page)
                 msg = (
                     f"用户：{display_name}\n"
-                    f"🔌 FreezeHost 站点不可用 / 未找到登录按钮\n"
+                    f"🔌 FreezeHost 站点不可用\n"
                     f"已重试 {MAX_SITE_RETRIES} 次仍失败\n"
-                    f"可能原因: 站点改版 / 网络问题 / Cloudflare 拦截\n"
-                    f"请手动访问 {BASE_URL} 检查\n\n"
+                    f"故障原因: {final_reason}\n"
+                    f"当前 URL: {page.url}\n"
+                    f"请稍后重试或手动访问 {BASE_URL} 检查\n\n"
                     f"FreezeHost Auto Renew"
                 )
                 send_tg(msg, buf)
