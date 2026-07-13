@@ -694,54 +694,73 @@ def run():
                     )
                     raise RuntimeError(f"未跳转到 Discord, 当前 URL: {current_url}")
 
-                # ── 关键: OAuth 自动完成, 等待跳回 FreezeHost ──
-                # 流程: Discord OAuth → 自动跳转 free.freezehost.pro/submitlogin?code=... → 自动跳 /dashboard
-                # storage_state 已经预加载 Token 到 discord.com 的 localStorage, Discord 会自动登录并完成 OAuth
-                # 我们只需等待整个流程完成, 不要在中间页面上做任何 evaluate (会破坏 FreezeHost 的 callback 处理)
+                # ── 关键: Discord OAuth 页面处理 ──
+                # 即使 URL 含 prompt=none, Discord 仍可能显示 Authorize 按钮需要点击
+                # 流程: Discord OAuth 页 → 点 Authorize → 跳 free.freezehost.pro/submitlogin → 跳 /dashboard
+                # storage_state 已经预加载 Token, Discord 页面会自动登录 (Signed in as xxx)
 
-                # 等 Discord 处理完 OAuth, 跳回 free.freezehost.pro
-                # 可能跳到 /submitlogin 或 /callback 或直接 /dashboard
+                # 等 Discord 页面完全加载
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except PlaywrightTimeout:
+                    log_warn("等待 Discord domcontentloaded 超时")
+
+                page.wait_for_timeout(3000)  # 等 SPA 渲染 Authorize 按钮
+
+                # 检查是否需要点 Authorize 按钮
+                # Discord OAuth 授权页有 "Authorize" 按钮, 必须点击才能完成授权
+                authorize_clicked = False
+                try:
+                    # 多组选择器找 Authorize 按钮
+                    authorize_selectors = [
+                        'button:has-text("Authorize")',
+                        'button:has-text("授权")',
+                        'button[type="submit"]:has-text("Authorize")',
+                        'div[class*="footer"] button[class*="primary"]',
+                        'button[class*="lookFilled"]',  # Discord 蓝色主按钮
+                    ]
+                    for sel in authorize_selectors:
+                        try:
+                            btn = page.locator(sel).last
+                            if btn.is_visible(timeout=2000):
+                                text = btn.inner_text().strip()
+                                # 排除 Cancel 按钮
+                                if any(k in text.lower() for k in ("cancel", "取消", "deny")):
+                                    continue
+                                log_info(f"找到 OAuth 按钮: '{text}', 选择器: {sel}")
+                                btn.click()
+                                log_info("已点击 Authorize 按钮")
+                                authorize_clicked = True
+                                break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    log_warn(f"查找 Authorize 按钮异常: {e}")
+
+                if not authorize_clicked:
+                    log_warn("未找到 Authorize 按钮, 可能 prompt=none 自动授权中, 等待跳转...")
+                    buf = take_screenshot(page, "no-authorize-btn")
+                    log_info(f"当前 URL: {page.url}")
+
+                # 等待跳转回 FreezeHost (精确判断, 不能只看 URL 含 'free.freezehost.pro' 因为 redirect_uri 也含)
+                # 必须是 URL 以 https://free.freezehost.pro 开头
                 try:
                     page.wait_for_url(
-                        lambda u: "free.freezehost.pro" in u,
+                        lambda u: u.startswith("https://free.freezehost.pro/"),
                         timeout=30000,
                     )
                     log_info(f"已跳回 FreezeHost: {page.url}")
                 except PlaywrightTimeout:
-                    # 还在 Discord, 检查是否需要点 Authorize 按钮
-                    if "discord.com" in page.url:
-                        log_warn(f"还在 Discord, 尝试处理 OAuth 授权页: {page.url}")
-                        try:
-                            page.wait_for_load_state("domcontentloaded", timeout=10000)
-                        except PlaywrightTimeout:
-                            pass
-                        # 检查是否有 Authorize 按钮
-                        try:
-                            for sel in ['button:has-text("Authorize")', 'button[type="submit"]',
-                                       'div[class*="footer"] button', 'button[class*="primary"]']:
-                                btn = page.locator(sel).last
-                                if btn.is_visible(timeout=2000):
-                                    text = btn.inner_text().strip()
-                                    if any(k in text.lower() for k in ("authorize", "授权", "accept")):
-                                        log_info(f"点击 OAuth 授权按钮: {text}")
-                                        btn.click()
-                                        break
-                        except Exception:
-                            pass
-                        # 再等跳转
-                        try:
-                            page.wait_for_url(lambda u: "free.freezehost.pro" in u, timeout=20000)
-                            log_info(f"OAuth 后跳回 FreezeHost: {page.url}")
-                        except PlaywrightTimeout:
-                            buf = take_screenshot(page, "oauth-stuck")
-                            send_tg(
-                                f"用户：{display_name}\n"
-                                f"❌ OAuth 完成后未跳回 FreezeHost\n"
-                                f"当前 URL: {page.url}\n"
-                                f"\nFreezeHost Auto Renew",
-                                buf,
-                            )
-                            raise RuntimeError(f"OAuth 后未跳回 FreezeHost, URL: {page.url}")
+                    buf = take_screenshot(page, "oauth-stuck")
+                    send_tg(
+                        f"用户：{display_name}\n"
+                        f"❌ OAuth 完成后未跳回 FreezeHost\n"
+                        f"当前 URL: {page.url}\n"
+                        f"是否点击 Authorize: {authorize_clicked}\n"
+                        f"\nFreezeHost Auto Renew",
+                        buf,
+                    )
+                    raise RuntimeError(f"OAuth 后未跳回 FreezeHost, URL: {page.url}")
 
                 # 已回到 FreezeHost, 等待 /submitlogin 自动跳到 /dashboard
                 # 不要在 /submitlogin 页面做 evaluate (会破坏 callback 处理)
