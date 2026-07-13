@@ -23,7 +23,7 @@ IS_PROXY      = os.environ.get("IS_PROXY", "false").lower() == "true"
 PROXY_SERVER  = os.environ.get("PROXY_SERVER", "").strip()
 
 TIMEOUT        = 60_000
-MAX_SITE_RETRIES = 3
+MAX_SITE_RETRIES = 5
 RETRY_WAIT     = 30_000          # ms between retries when site is down
 SCREENSHOT_DIR = Path("screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
@@ -204,25 +204,47 @@ def merge_screenshots(browser, buffers: list[bytes]) -> bytes | None:
 
 def check_site_down(page) -> bool:
     """Detect FreezeHost 'CONNECTION TO THE MANAGEMENT SERVICES LOST' or similar outage screens.
-    兼容大小写: HTML 里是 'Connection to the Management Services Lost' (首字母大写)
+    多种检测方式兜底:
+    1. innerText (渲染后的文本)
+    2. textContent (所有文本, 包括隐藏元素)
+    3. title 标签
+    4. page.locator 直接找元素
     """
+    # 方式 1: 用 page.locator 找 OOPS / Retry Now 元素 (最可靠)
     try:
-        return page.evaluate("""() => {
-            const body = document.body ? document.body.innerText : '';
-            const bodyLower = body.toLowerCase();
-            // 大小写不敏感匹配
-            if (bodyLower.includes('connection to the management services lost')) return true;
-            if (bodyLower.includes('retrying in') && bodyLower.includes('retry now')) return true;
-            if (bodyLower.includes('service unavailable')) return true;
-            // 检查 Retry Now 按钮 (大小写不敏感)
-            const retryBtn = document.querySelector('button');
-            if (retryBtn && retryBtn.innerText && retryBtn.innerText.toLowerCase().includes('retry now')) return true;
-            // 检查 OOPS 标题 (FreezeHost 错误页特征)
-            if (bodyLower.includes('oops') && bodyLower.includes('retry')) return true;
+        for sel in ['h1:has-text("OOPS")', 'button:has-text("Retry Now")',
+                   'p:has-text("Management Services Lost")',
+                   'p:has-text("management services lost")',
+                   'h1:has-text("Oops")']:
+            try:
+                if page.locator(sel).first.is_visible(timeout=500):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 方式 2: 用 JavaScript 读 innerText + textContent + title
+    try:
+        result = page.evaluate("""() => {
+            const body = document.body;
+            const innerText = body ? body.innerText : '';
+            const textContent = body ? body.textContent : '';
+            const title = document.title || '';
+            const all = (innerText + ' ' + textContent + ' ' + title).toLowerCase();
+            // 大小写不敏感匹配多种错误页特征
+            if (all.includes('connection to the management services lost')) return true;
+            if (all.includes('retrying in') && all.includes('retry now')) return true;
+            if (all.includes('service unavailable')) return true;
+            if (all.includes('oops') && all.includes('retry')) return true;
             return false;
         }""")
+        if result:
+            return True
     except Exception:
-        return False
+        pass
+
+    return False
 
 
 # 多组选择器: FreezeHost 可能改版, 不再只用 span.text-lg
