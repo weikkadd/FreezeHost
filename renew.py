@@ -771,6 +771,16 @@ def run():
             "--disable-dev-shm-usage",
             "--window-size=1280,753",
             f"--user-agent={REAL_UA}",  # 启动参数也指定 UA
+            # 关键: 强制 GPU 硬件加速, 避免 WebGL 用 SwiftShader 软件渲染
+            # FreezeHost 检测 webdriver_with_software_rendering
+            "--enable-gpu",
+            "--use-gl=swiftshader",  # 至少用 swiftshader 而不是完全软件渲染
+            "--ignore-gpu-blocklist",
+            "--enable-webgl",
+            "--enable-features=NetworkService,NetworkServiceInProcess",
+            "--disable-features=IsolateOrigins,site-per-process",
+            # 伪造屏幕分辨率 (FreezeHost 检测 screenResolution)
+            "--force-device-scale-factor=1",
         ],
     }
     if IS_PROXY and PROXY_SERVER:
@@ -879,10 +889,66 @@ def run():
                     window.chrome = {{ runtime: {{}} }};
                 }}
             }} catch(e) {{}}
+
+            // 8. 伪造 WebGL 渲染器 (FreezeHost 检测 software_rendering)
+            // headless 默认 WebGL 返回 SwiftShader, 真实浏览器返回 GPU 厂商
+            try {{
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {{
+                    // UNMASKED_VENDOR_WEBGL = 37445
+                    if (parameter === 37445) return 'Intel Inc.';
+                    // UNMASKED_RENDERER_WEBGL = 37446
+                    if (parameter === 37446) return 'Intel(R) Iris(TM) Plus Graphics 640';
+                    return getParameter.call(this, parameter);
+                }};
+            }} catch(e) {{}}
+            try {{
+                if (typeof WebGL2RenderingContext !== 'undefined') {{
+                    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+                    WebGL2RenderingContext.prototype.getParameter = function(parameter) {{
+                        if (parameter === 37445) return 'Intel Inc.';
+                        if (parameter === 37446) return 'Intel(R) Iris(TM) Plus Graphics 640';
+                        return getParameter2.call(this, parameter);
+                    }};
+                }}
+            }} catch(e) {{}}
+
+            // 9. 伪造 hardwareConcurrency (headless 默认 4, 改成 8 更像真实)
+            try {{
+                Object.defineProperty(navigator, 'hardwareConcurrency', {{
+                    get: () => 8,
+                    configurable: true
+                }});
+            }} catch(e) {{}}
+
+            // 10. 伪造 deviceMemory (headless 默认 4/16, 改成 8)
+            try {{
+                Object.defineProperty(navigator, 'deviceMemory', {{
+                    get: () => 8,
+                    configurable: true
+                }});
+            }} catch(e) {{}}
         """)
         page = context.new_page()
         page.set_default_timeout(TIMEOUT)
         log_info("浏览器就绪 (已预加载 Discord Token + 反检测脚本)")
+
+        # 诊断: 打印实际 UA 和 webdriver 状态, 确认反检测生效
+        try:
+            page.goto("about:blank", wait_until="domcontentloaded", timeout=5000)
+            actual_ua = page.evaluate("() => navigator.userAgent")
+            actual_webdriver = page.evaluate("() => navigator.webdriver")
+            actual_vendor = page.evaluate("() => { try { const c = document.createElement('canvas'); const gl = c.getContext('webgl'); return gl ? gl.getParameter(37446) : 'no webgl'; } catch(e) { return 'error: ' + e.message; } }")
+            log_info(f"📋 反检测诊断:")
+            log_info(f"   navigator.userAgent: {actual_ua}")
+            log_info(f"   navigator.webdriver: {actual_webdriver}")
+            log_info(f"   WebGL renderer: {actual_vendor}")
+            if "HeadlessChrome" in actual_ua:
+                log_error("❌ UA 还是 HeadlessChrome! 反检测没生效, 会被 FreezeHost 检测到")
+            else:
+                log_info("✅ UA 已伪装为普通 Chrome")
+        except Exception as e:
+            log_warn(f"反检测诊断失败: {e}")
 
         display_name = "未知用户"
 
