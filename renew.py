@@ -576,11 +576,31 @@ def run():
     else:
         log_info("启动浏览器 (直连, 无代理 - 可能被 FreezeHost 拉黑)")
 
+    # 用 storage_state 在启动时直接写入 Discord Token 到 localStorage
+    # 这是 Playwright 官方推荐方式, 不依赖页面加载时机
+    # 关键: origins 必须是 https://discord.com, name 是 'token', value 是带引号的 JSON 字符串
+    storage_state = {
+        "cookies": [],
+        "origins": [
+            {
+                "origin": "https://discord.com",
+                "localStorage": [
+                    {"name": "token", "value": json.dumps(DISCORD_TOKEN)}
+                ]
+            }
+        ]
+    }
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(**launch_kwargs)
-        page = browser.new_page(viewport={"width": VIEWPORT_W, "height": VIEWPORT_H})
+        # 用 storage_state 创建 context, 这样 discord.com 的 localStorage 会预写入 token
+        context = browser.new_context(
+            viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
+            storage_state=storage_state,
+        )
+        page = context.new_page()
         page.set_default_timeout(TIMEOUT)
-        log_info("浏览器就绪")
+        log_info("浏览器就绪 (已预加载 Discord Token 到 localStorage)")
 
         display_name = "未知用户"
 
@@ -657,58 +677,31 @@ def run():
                 page.wait_for_url(re.compile(r"discord\.com"), timeout=15000)
                 log_info("已到达 Discord")
 
-                # ── 注入 Token ────────────────────────────────
-                # 多策略注入 (按可靠性排序):
-                #   A. add_init_script (每个新页面加载前执行, 对所有跳转生效)
-                #   B. page.evaluate 直接执行 (当前页面立即生效)
-                #   C. context.add_cookies (备份, Discord token 不在 cookie, 此步可跳过)
-                # 注入后立即验证 localStorage.token 是否存在, 不存在则报错
+                # ── Token 已通过 storage_state 预加载, 只需验证 ───
+                # storage_state 在浏览器启动时就写入了 localStorage, 跳转到 discord.com 后应能读到
+                page.wait_for_timeout(2000)  # 等页面完全加载
 
-                # 策略 A: add_init_script
+                # 验证 localStorage.token 是否存在
                 try:
-                    # 注意: Discord localStorage 的 token 值带双引号 (JSON 字符串)
-                    token_value = json.dumps(DISCORD_TOKEN)  # 自动加双引号
-                    page.add_init_script(f"""() => {{
-                        try {{
-                            window.localStorage.setItem('token', '{token_value}');
-                        }} catch (e) {{}}
-                    }}""")
-                    log_info("Token init script 已注册 (策略 A)")
-                except Exception as e:
-                    log_warn(f"策略 A (add_init_script) 注册失败: {e}")
-
-                # 策略 B: page.evaluate 直接执行 (双保险, 立即生效)
-                try:
-                    result = page.evaluate("""(token) => {
+                    stored = page.evaluate("""() => {
                         try {
-                            window.localStorage.setItem('token', JSON.stringify(token));
                             return window.localStorage.getItem('token');
                         } catch(e) {
                             return 'ERROR: ' + e.message;
                         }
-                    }""", DISCORD_TOKEN)
-                    if result and 'ERROR' not in str(result):
-                        log_info(f"策略 B (evaluate) 注入成功, localStorage.token 长度: {len(str(result))}")
-                    else:
-                        log_warn(f"策略 B (evaluate) 注入失败: {result}")
-                except Exception as e:
-                    log_warn(f"策略 B (evaluate) 异常: {e}")
-
-                # 验证注入是否真的生效
-                try:
-                    stored = page.evaluate("() => { try { return window.localStorage.getItem('token'); } catch(e) { return null; } }")
-                    if not stored:
-                        log_error("❌ Token 注入后 localStorage.token 为 null, 注入失败")
+                    }""")
+                    if not stored or 'ERROR' in str(stored):
+                        log_error(f"❌ Token 未在 localStorage 中找到: {stored}")
                         buf = take_screenshot(page, "inject-failed")
                         send_tg(
                             f"用户：{display_name}\n"
-                            f"❌ Token 注入失败 (localStorage 无法写入)\n"
-                            f"可能原因: 浏览器策略限制 / Discord CSP 拦截\n"
+                            f"❌ Token 注入失败 (storage_state 未生效)\n"
+                            f"localStorage.token: {stored}\n"
                             f"\nFreezeHost Auto Renew",
                             buf,
                         )
-                        raise RuntimeError("Token 注入失败, localStorage 写入无效")
-                    log_info(f"✅ Token 已写入 localStorage (长度 {len(stored)})")
+                        raise RuntimeError(f"Token 注入失败, localStorage.token = {stored}")
+                    log_info(f"✅ Token 已在 localStorage 中 (长度 {len(stored)})")
                 except RuntimeError:
                     raise
                 except Exception as e:
@@ -847,6 +840,10 @@ def run():
             send_tg(f"用户：{display_name}\n❌ 异常: {e}\n\nFreezeHost Auto Renew", buf)
             raise
         finally:
+            try:
+                context.close()
+            except Exception:
+                pass
             browser.close()
 
 
