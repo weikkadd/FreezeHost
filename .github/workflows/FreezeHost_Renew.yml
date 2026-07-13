@@ -29,10 +29,6 @@ jobs:
     permissions:
       contents: write
       actions: write
-    env:
-      # 默认 false: 用 GitHub Actions 原生 IP (避免被 FreezeHost 当代理拉黑)
-      # 设为 true: 启用 WARP (如果你之前的设置好使可以打开)
-      ENABLE_WARP: ${{ vars.ENABLE_WARP || 'false' }}
 
     steps:
       - name: 确定使用哪个 Token
@@ -71,12 +67,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq bc
 
-      - name: 启用 WARP 网络（可选，若被 FreezeHost 拉黑则禁用此步骤）
-        if: ${{ env.ENABLE_WARP == 'true' }}
-        uses: fscarmen/warp-on-actions@v1.3
-        with:
-          stack: dual
-          mode: client
+      - name: 设置代理 (sing-box, 复用 katabump 同款脚本)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.PROXY_URL }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
 
       - name: 修复 DNS & 验证出口 IP
         run: |
@@ -95,10 +91,14 @@ jobs:
           nslookup free.freezehost.pro 1.1.1.1 || echo "[WARN] 解析失败"
 
           echo ""
-          echo "[INFO] 当前出口 IP (GitHub Actions 原生):"
-          curl -s --max-time 10 https://api.ipify.org && echo
-          echo "[INFO] Cloudflare Trace:"
-          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
+          if [ "${IS_PROXY}" = "true" ]; then
+            echo "[INFO] 当前出口 IP (通过 sing-box 代理 ${PROXY_SERVER}):"
+            curl -x "$PROXY_SERVER" -s --max-time 10 https://api.ipify.org && echo
+          else
+            echo "[INFO] 当前出口 IP (GitHub Actions 原生):"
+            curl -s --max-time 10 https://api.ipify.org && echo
+            echo "[WARN] 未启用代理, FreezeHost 可能会拉黑"
+          fi
 
       - name: 设置 Discord Token
         run: |
@@ -122,8 +122,11 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TOKEN_NUM: ${{ steps.select_token.outputs.token_number }}
+          IS_PROXY: ${{ env.IS_PROXY }}
+          PROXY_SERVER: ${{ env.PROXY_SERVER }}
         run: |
           echo "使用 Token 编号: ${{ steps.select_token.outputs.token_number }}"
+          echo "代理状态: IS_PROXY=${IS_PROXY:-false}, PROXY_SERVER=${PROXY_SERVER:-无}"
           python renew.py 2>&1 | tee renew.log
 
       - name: 提取剩余天数（取所有服务器的最小值）

@@ -17,6 +17,11 @@ DISCORD_TOKEN = os.environ.get("FREEZEHOST_DISCORD_TOKEN", "").strip()
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID", "").strip()
 
+# 代理配置 (复用 katabump 的 sing-box 方案)
+# IS_PROXY=true 时 PROXY_SERVER 形如 socks5://127.0.0.1:1080
+IS_PROXY      = os.environ.get("IS_PROXY", "false").lower() == "true"
+PROXY_SERVER  = os.environ.get("PROXY_SERVER", "").strip()
+
 TIMEOUT        = 60_000
 MAX_SITE_RETRIES = 3
 RETRY_WAIT     = 30_000          # ms between retries when site is down
@@ -562,10 +567,17 @@ def run():
     if not DISCORD_TOKEN:
         raise RuntimeError("缺少 FREEZEHOST_DISCORD_TOKEN")
 
-    log_info("启动浏览器 (WARP 系统级代理)")
+    # 启动浏览器 (可选 sing-box 代理, 复用 katabump 方案)
+    launch_kwargs = {"headless": True}
+    if IS_PROXY and PROXY_SERVER:
+        # Playwright 接受形如 "socks5://127.0.0.1:1080" 或 "http://127.0.0.1:1081"
+        launch_kwargs["proxy"] = {"server": PROXY_SERVER}
+        log_info(f"启动浏览器 (代理: {PROXY_SERVER})")
+    else:
+        log_info("启动浏览器 (直连, 无代理 - 可能被 FreezeHost 拉黑)")
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
+        browser = pw.chromium.launch(**launch_kwargs)
         page = browser.new_page(viewport={"width": VIEWPORT_W, "height": VIEWPORT_H})
         page.set_default_timeout(TIMEOUT)
         log_info("浏览器就绪")

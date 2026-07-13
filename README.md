@@ -20,7 +20,7 @@
 - 最多支持 5 个 Discord Token，各自拥有独立 Cron 计划
 - 站点宕机自动重试（最多 3 次）
 - 续期后计算下次运行时间（到期前 2 天），自动更新 Workflow 中的 Cron 表达式
-- WARP 代理保障网络连通
+- **sing-box 代理**（复用 katabump 同款方案）绕过 FreezeHost 数据中心 IP 拉黑
 - Telegram 通知推送续期结果（含合并截图）
 
 ### 重启
@@ -39,9 +39,25 @@
 | `FREEZEHOST_DISCORD_TOKEN_3` | ❌ | 第 3 个 Discord 账号 Token（可选） |
 | `FREEZEHOST_DISCORD_TOKEN_4` | ❌ | 第 4 个 Discord 账号 Token（可选） |
 | `FREEZEHOST_DISCORD_TOKEN_5` | ❌ | 第 5 个 Discord 账号 Token（可选） |
+| `PROXY_URL` | ✅ | sing-box 节点链接 (vless/vmess/trojan/tuic/anytls/hysteria2/socks5)，**FreezeHost 会拉黑 GitHub Actions 原生 IP，必须配代理** |
 | `REPO_TOKEN` | ✅ （仅续期） | 具有 `repo` 和 `workflow` 权限的 PAT，用于自动更新 Cron |
 | `TG_BOT_TOKEN` | ❌ | Telegram Bot Token，用于推送通知 |
 | `TG_CHAT_ID` | ❌ | Telegram 接收消息的 Chat ID |
+
+### 关于 PROXY_URL（重要）
+
+FreezeHost 会检测数据中心 IP（包括 GitHub Actions 的 Azure 段、Cloudflare WARP）并返回：
+```
+we have detected that you are using a proxy to access our hosting service
+which is against our TOS and thus you have been blocked from using our hosting
+```
+
+因此必须配置一个**住宅 IP / 真实 VPS** 的代理节点。本仓库复用 katabump 的 sing-box 方案，支持以下协议：
+- `vless://` / `vmess://` / `trojan://`
+- `tuic://` / `hysteria2://` / `hy2://`
+- `anytls://` / `socks5://` / `socks://`
+
+如果你已经在 katabump 仓库配过 `PROXY_URL`，直接复用同一个节点即可。
 
 ### 获取 Discord Token
 
@@ -104,8 +120,8 @@ curl -X POST "https://api.github.com/repos/<用户名>/<仓库名>/actions/workf
 ## 工作原理（续期）
 
 1. 根据 Cron 或手动选择确定要使用的 Token 编号
-2. 拉取仓库、安装 Playwright，启动 WARP 代理
-3. Python 脚本模拟浏览器登录 FreezeHost（Discord OAuth）
+2. 拉取仓库、安装 Playwright，通过 `setup_proxy.sh` 启动 sing-box 代理
+3. Python 脚本通过代理启动 Chromium，模拟浏览器登录 FreezeHost（Discord OAuth）
 4. 扫描 Dashboard 下所有服务器，逐一检查剩余时间并执行续期
 5. 提取最小剩余天数，计算下次运行时间（到期前 2 天）
 6. 使用 `REPO_TOKEN` 自动更新对应 Cron 行并提交
@@ -114,7 +130,7 @@ curl -X POST "https://api.github.com/repos/<用户名>/<仓库名>/actions/workf
 ## 工作原理（重启）
 
 1. 手动或 API 触发时指定 Token 编号
-2. 拉取仓库、安装 Playwright，启动 WARP 代理
+2. 拉取仓库、安装 Playwright，通过 sing-box 代理出口
 3. 脚本登录 FreezeHost，发现所有服务器
 4. 检测每台服务器电源状态：
    - 运行中 → 执行重启
