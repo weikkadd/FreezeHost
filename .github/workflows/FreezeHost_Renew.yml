@@ -65,7 +65,7 @@ jobs:
           pip install playwright
           playwright install chromium --with-deps
           sudo apt-get update
-          sudo apt-get install -y jq bc
+          sudo apt-get install -y jq bc xvfb
 
       - name: 设置代理 (sing-box, 复用 katabump 同款脚本)
         continue-on-error: true
@@ -127,7 +127,9 @@ jobs:
         run: |
           echo "使用 Token 编号: ${{ steps.select_token.outputs.token_number }}"
           echo "代理状态: IS_PROXY=${IS_PROXY:-false}, PROXY_SERVER=${PROXY_SERVER:-无}"
-          python renew.py 2>&1 | tee renew.log
+          # 用 xvfb-run 提供虚拟显示器, 让 headless=False 的 Chromium 能跑
+          # 否则 FreezeHost 会检测到 headless 模式并永久封禁 IP+账号
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py 2>&1 | tee renew.log
 
       - name: 提取剩余天数（取所有服务器的最小值）
         id: extract_days

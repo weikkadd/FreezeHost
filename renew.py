@@ -568,11 +568,21 @@ def run():
         raise RuntimeError("缺少 FREEZEHOST_DISCORD_TOKEN")
 
     # 启动浏览器 (可选 sing-box 代理, 复用 katabump 方案)
-    launch_kwargs = {"headless": True}
+    # 关键: 用 headless=False 绕过 FreezeHost 的 headless 检测
+    # 在 GitHub Actions 里配合 xvfb-run 使用, 提供虚拟显示器
+    launch_kwargs = {
+        "headless": False,  # 必须非 headless, 否则被 FreezeHost 检测拉黑
+        "args": [
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",  # 隐藏 navigator.webdriver
+            "--disable-dev-shm-usage",
+            "--window-size=1280,753",
+        ],
+    }
     if IS_PROXY and PROXY_SERVER:
         # Playwright 接受形如 "socks5://127.0.0.1:1080" 或 "http://127.0.0.1:1081"
         launch_kwargs["proxy"] = {"server": PROXY_SERVER}
-        log_info(f"启动浏览器 (代理: {PROXY_SERVER})")
+        log_info(f"启动浏览器 (代理: {PROXY_SERVER}, 非 headless 反检测)")
     else:
         log_info("启动浏览器 (直连, 无代理 - 可能被 FreezeHost 拉黑)")
 
@@ -597,10 +607,38 @@ def run():
         context = browser.new_context(
             viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
             storage_state=storage_state,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            locale="en-US",
+            timezone_id="America/New_York",
         )
+        # 注入反检测脚本: 隐藏 webdriver 标志
+        context.add_init_script("""
+            // 隐藏 navigator.webdriver
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+            // 伪造 plugins 长度 (headless 默认是 0, 普通浏览器有 3+)
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5]
+            });
+
+            // 伪造 languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en']
+            });
+
+            // 伪造 permissions API
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) =>
+                parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters);
+
+            // 隐藏 chrome runtime
+            window.chrome = { runtime: {} };
+        """)
         page = context.new_page()
         page.set_default_timeout(TIMEOUT)
-        log_info("浏览器就绪 (已预加载 Discord Token 到 localStorage)")
+        log_info("浏览器就绪 (已预加载 Discord Token + 反检测脚本)")
 
         display_name = "未知用户"
 
