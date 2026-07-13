@@ -133,11 +133,7 @@ def send_tg(caption: str, image_bytes: bytes | None = None):
     if not TG_CHAT_ID or not TG_BOT_TOKEN:
         log_warn("TG 未配置，跳过推送")
         return
-    # 自动在通知末尾加上续期网站 URL (除非已经包含)
-    if "free.freezehost.pro" not in caption and "FreezeHost Auto Renew" in caption:
-        caption = caption.replace("FreezeHost Auto Renew", f"🌐 {BASE_URL}\nFreezeHost Auto Renew")
-    elif "free.freezehost.pro" not in caption and "FreezeHost Auto Renew" not in caption:
-        caption = caption.rstrip() + f"\n\n🌐 {BASE_URL}\nFreezeHost Auto Renew"
+    # 不再自动加 URL, 保持通知简洁 (参考 Godlike 格式)
     try:
         if image_bytes:
             boundary = f"----Boundary{abs(hash(caption))}"
@@ -1171,18 +1167,19 @@ def run():
                          else merge_screenshots(browser, screenshots) if screenshots
                          else None)
 
-            # ── TG 推送（完整信息） ──────────────────────
+            # ── TG 推送（简洁格式, 参考 Godlike） ──────
             lines = []
             for r in results:
                 sid = r['server_id']
-                server_url = f"{BASE_URL}/server-console?id={sid}"
-                s = f"服务器: {sid} | {r['emoji']}{r['status_label']}"
+                # emoji 转 ✓/✗/!
+                simple = "✓" if r['status'] in ('renewed',) else "✗" if r['status'] in ('error', 'broke') else "!"
+                s = f"{simple} 服务器 {sid}: {r['status_label']}"
                 if r["detail"]:
-                    s += f" {r['detail']}"
-                s += f"\n🌐 {server_url}"
+                    s += f" ({r['detail']})"
                 lines.append(s)
 
-            send_tg("\n".join([f"用户：{display_name}", *lines, "", "FreezeHost Auto Renew"]), final_img)
+            now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+            send_tg("\n".join([f"账号: {display_name}", *lines, f"时间: {now_str}", "FreezeHost Auto Renew"]), final_img)
             log_info("所有服务器处理完毕")
 
         except Exception as e:
