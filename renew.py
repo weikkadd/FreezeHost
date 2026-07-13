@@ -211,9 +211,56 @@ def check_site_down(page) -> bool:
         return False
 
 
+# 多组选择器: FreezeHost 可能改版, 不再只用 span.text-lg
+LOGIN_BUTTON_SELECTORS = [
+    'span.text-lg:has-text("Login with Discord")',
+    'span:has-text("Login with Discord")',
+    'button:has-text("Login with Discord")',
+    'a:has-text("Login with Discord")',
+    'div:has-text("Login with Discord")',
+    '[class*="login"]:has-text("Discord")',
+    'span:has-text("Discord でログイン")',  # 日语
+    'span:has-text("Discordでログイン")',
+    'span:has-text("以 Discord 登录")',     # 中文
+    'span:has-text("使用 Discord 登录")',
+]
+
+
+def find_login_button(page, timeout_ms: int = 2000):
+    """尝试多组选择器查找登录按钮, 找到返回 locator, 否则 None"""
+    for sel in LOGIN_BUTTON_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=timeout_ms):
+                log_info(f"找到登录按钮, 选择器: {sel}")
+                return loc
+        except Exception:
+            continue
+    return None
+
+
+def is_already_logged_in(page) -> bool:
+    """检测是否已登录态 (跳过了登录页直接到 dashboard)"""
+    try:
+        url = page.url or ""
+        if "/dashboard" in url or "/server-console" in url or "/callback" in url:
+            return True
+        # 检查页面是否有登出按钮 / 服务器列表等登录后才会出现的元素
+        for sel in ['a[href*="dashboard"]', 'a[href*="server-console"]',
+                    'button:has-text("Logout")', 'button:has-text("Sign out")']:
+            try:
+                if page.locator(sel).first.is_visible(timeout=1000):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
 def wait_for_site_ready(page) -> bool:
     """Try loading FreezeHost up to MAX_SITE_RETRIES times, handling outage screens.
-    Returns True if site became available, False if still down after all retries."""
+    Returns True if site became available AND login button is visible OR already logged in."""
     for attempt in range(1, MAX_SITE_RETRIES + 1):
         log_info(f"加载 FreezeHost 首页 (尝试 {attempt}/{MAX_SITE_RETRIES})...")
         try:
@@ -224,7 +271,8 @@ def wait_for_site_ready(page) -> bool:
                 page.wait_for_timeout(RETRY_WAIT)
             continue
 
-        page.wait_for_timeout(3000)
+        # SPA 渲染需要时间, 5s 比 3s 更稳妥
+        page.wait_for_timeout(5000)
 
         if check_site_down(page):
             log_warn(f"FreezeHost 后端服务不可用 (尝试 {attempt})")
@@ -239,7 +287,11 @@ def wait_for_site_ready(page) -> bool:
                     page.wait_for_timeout(10_000)
                     if not check_site_down(page):
                         log_info("站点恢复正常")
-                        return True
+                        # 继续往下检查登录按钮
+                    else:
+                        if attempt < MAX_SITE_RETRIES:
+                            page.wait_for_timeout(RETRY_WAIT)
+                        continue
             except Exception:
                 pass
 
@@ -248,18 +300,30 @@ def wait_for_site_ready(page) -> bool:
                 page.wait_for_timeout(RETRY_WAIT)
             continue
 
-        # Check if the login button is present
-        try:
-            login_visible = page.locator('span.text-lg:has-text("Login with Discord")').is_visible()
-            if login_visible:
-                log_info("首页加载正常，登录按钮可见")
-                return True
-        except Exception:
-            pass
+        # 1) 检测是否已登录 (跳过登录页)
+        if is_already_logged_in(page):
+            log_info(f"检测到已登录状态, 当前 URL: {page.url}")
+            return True
 
-        # Page loaded but no login button and not the known error page — might be OK
-        log_info("首页已加载（未检测到宕机页面）")
-        return True
+        # 2) 多组选择器查找登录按钮
+        btn = find_login_button(page, timeout_ms=2000)
+        if btn:
+            log_info("首页加载正常, 登录按钮可见")
+            return True
+
+        # 3) 还没找到 -> 截图 + 保存 HTML 供排查, 然后重试
+        log_warn(f"首页已加载但未找到登录按钮 (尝试 {attempt})")
+        take_screenshot(page, f"no-login-btn-{attempt}")
+        try:
+            html_path = SCREENSHOT_DIR / f"no-login-btn-{attempt}.html"
+            html_path.write_text(page.content(), encoding="utf-8")
+            log_info(f"页面 HTML 已保存: {html_path}")
+        except Exception as e:
+            log_warn(f"保存 HTML 失败: {e}")
+
+        if attempt < MAX_SITE_RETRIES:
+            log_info(f"等待 {RETRY_WAIT // 1000} 秒后重试...")
+            page.wait_for_timeout(RETRY_WAIT)
 
     return False
 
@@ -524,107 +588,145 @@ def run():
                 buf = take_screenshot(page, "site-down-final")
                 msg = (
                     f"用户：{display_name}\n"
-                    f"🔌 FreezeHost 站点宕机\n"
-                    f"CONNECTION TO THE MANAGEMENT SERVICES LOST\n"
-                    f"已重试 {MAX_SITE_RETRIES} 次仍无法连接\n\n"
+                    f"🔌 FreezeHost 站点不可用 / 未找到登录按钮\n"
+                    f"已重试 {MAX_SITE_RETRIES} 次仍失败\n"
+                    f"可能原因: 站点改版 / 网络问题 / Cloudflare 拦截\n"
+                    f"请手动访问 {BASE_URL} 检查\n\n"
                     f"FreezeHost Auto Renew"
                 )
                 send_tg(msg, buf)
-                log_warn("站点宕机，本次跳过续期")
+                log_warn("站点不可用，本次跳过续期")
                 return   # Exit gracefully — not a script error
 
-            # ── 登录 ─────────────────────────────────────
-            page.click('span.text-lg:has-text("Login with Discord")', timeout=15_000)
-
-            confirm_btn = page.locator("button#confirm-login")
-            confirm_btn.wait_for(state="visible")
-            confirm_btn.click()
-            log_info("已接受服务条款")
-
-            page.wait_for_url(re.compile(r"discord\.com"), timeout=15000)
-            log_info("已到达 Discord")
-
-            # ── 注入 Token ────────────────────────────────
-            # 旧方案：用 iframe.contentWindow.localStorage 注入，
-            #   但 Discord 页面的 CSP / sandbox 会让 contentWindow 为 null，导致抛错。
-            # 新方案：add_init_script 在每个页面加载前注入 localStorage，
-            #   不依赖 iframe，绕过 CSP，且对所有后续跳转也生效。
-            try:
-                page.add_init_script(f"""() => {{
-                    try {{
-                        localStorage.setItem('token', JSON.stringify({json.dumps(DISCORD_TOKEN)}));
-                    }} catch (e) {{}}
-                }}""")
-                log_info("Token init script 已注册")
-            except Exception as e:
-                log_warn(f"add_init_script 注册失败，回退到 evaluate 注入: {e}")
-                try:
-                    page.evaluate("""(token) => {
-                        try { localStorage.setItem('token', '"'+token+'"'); } catch(e) {}
-                    }""", DISCORD_TOKEN)
-                except Exception as e2:
-                    log_error(f"evaluate 注入也失败: {e2}")
-
-            page.reload(wait_until="domcontentloaded")
-            page.wait_for_timeout(3000)
-
-            if re.search(r"discord\.com/login", page.url):
-                buf = take_screenshot(page, "token-failed")
-                send_tg(
-                    f"用户：{display_name}\n"
-                    f"❌ Discord Token 已失效\n"
-                    f"请重新获取 Token 并更新 GitHub Secrets:\n"
-                    f"  FREEZEHOST_DISCORD_TOKEN_{int(os.environ.get('TOKEN_NUM', '1'))}\n"
-                    f"教程: 浏览器 F12 → Network → 任意请求 → Headers → Authorization\n"
-                    f"\nFreezeHost Auto Renew",
-                    buf,
-                )
-                raise RuntimeError("Token 登录失败（Token 已失效，需更新 GitHub Secrets）")
-
-            log_info("Token 注入成功")
-
-            # ── OAuth ─────────────────────────────────────
-            try:
-                page.wait_for_url(re.compile(r"discord\.com/oauth2/authorize"), timeout=6000)
-                page.wait_for_timeout(2000)
-                if "discord.com" in page.url:
-                    handle_oauth_page(page)
-                if "discord.com" in page.url:
+            # ── 已登录态直接跳过 OAuth ───────────────────
+            skipped_oauth = False
+            if is_already_logged_in(page):
+                log_info(f"已是登录态, 跳过 OAuth 流程, 当前 URL: {page.url}")
+                skipped_oauth = True
+                # 跳到 dashboard 发现服务器
+                if "/dashboard" not in page.url:
+                    page.goto(f"{BASE_URL}/dashboard", wait_until="networkidle")
+                    page.wait_for_timeout(3000)
+            else:
+                # ── 登录 ─────────────────────────────────────
+                # 用 find_login_button 找到的 locator 点击, 不再硬编码选择器
+                btn = find_login_button(page, timeout_ms=5000)
+                if not btn:
+                    buf = take_screenshot(page, "login-btn-not-found")
                     try:
-                        page.wait_for_url(re.compile(r"free\.freezehost\.pro"), timeout=20000)
-                    except PlaywrightTimeout:
-                        buf = take_screenshot(page, "oauth-stuck")
-                        send_tg(
-                            f"用户：{display_name}\n"
-                            f"❌ OAuth 授权页卡住，未能跳转回 FreezeHost\n"
-                            f"可能原因: Discord OAuth 页面 DOM 改版 / Token 权限不足 / 网络问题\n"
-                            f"建议: 手动登录一次 https://free.freezehost.pro 完成授权后重试\n"
-                            f"\nFreezeHost Auto Renew",
-                            buf,
-                        )
-                        raise RuntimeError("OAuth 未跳转（已发截图供人工排查）")
-            except PlaywrightTimeout:
-                if "discord.com" in page.url:
-                    buf = take_screenshot(page, "oauth-timeout")
+                        html_path = SCREENSHOT_DIR / "login-btn-not-found.html"
+                        html_path.write_text(page.content(), encoding="utf-8")
+                    except Exception:
+                        pass
                     send_tg(
                         f"用户：{display_name}\n"
-                        f"❌ OAuth 等待 authorize 页超时\n"
-                        f"当前 URL: {page.url}\n"
+                        f"❌ 找不到 Login with Discord 按钮\n"
+                        f"FreezeHost 页面可能改版, 请检查截图\n"
+                        f"当前 URL: {page.url}\n\n"
+                        f"FreezeHost Auto Renew",
+                        buf,
+                    )
+                    raise RuntimeError("找不到登录按钮, FreezeHost 可能改版")
+
+                btn.click()
+                log_info("已点击登录按钮")
+
+                # 等待可能出现的「服务条款确认」对话框
+                try:
+                    confirm_btn = page.locator("button#confirm-login")
+                    confirm_btn.wait_for(state="visible", timeout=5000)
+                    confirm_btn.click()
+                    log_info("已接受服务条款")
+                except PlaywrightTimeout:
+                    log_info("未出现服务条款确认对话框, 继续")
+                except Exception as e:
+                    log_warn(f"服务条款确认异常: {e}")
+
+                page.wait_for_url(re.compile(r"discord\.com"), timeout=15000)
+                log_info("已到达 Discord")
+
+                # ── 注入 Token ────────────────────────────────
+                # 旧方案：用 iframe.contentWindow.localStorage 注入，
+                #   但 Discord 页面的 CSP / sandbox 会让 contentWindow 为 null，导致抛错。
+                # 新方案：add_init_script 在每个页面加载前注入 localStorage，
+                #   不依赖 iframe，绕过 CSP，且对所有后续跳转也生效。
+                try:
+                    page.add_init_script(f"""() => {{
+                        try {{
+                            localStorage.setItem('token', JSON.stringify({json.dumps(DISCORD_TOKEN)}));
+                        }} catch (e) {{}}
+                    }}""")
+                    log_info("Token init script 已注册")
+                except Exception as e:
+                    log_warn(f"add_init_script 注册失败，回退到 evaluate 注入: {e}")
+                    try:
+                        page.evaluate("""(token) => {
+                            try { localStorage.setItem('token', '"'+token+'"'); } catch(e) {}
+                        }""", DISCORD_TOKEN)
+                    except Exception as e2:
+                        log_error(f"evaluate 注入也失败: {e2}")
+
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
+
+                if re.search(r"discord\.com/login", page.url):
+                    buf = take_screenshot(page, "token-failed")
+                    send_tg(
+                        f"用户：{display_name}\n"
+                        f"❌ Discord Token 已失效\n"
+                        f"请重新获取 Token 并更新 GitHub Secrets:\n"
+                        f"  FREEZEHOST_DISCORD_TOKEN_{int(os.environ.get('TOKEN_NUM', '1'))}\n"
+                        f"教程: 浏览器 F12 → Network → 任意请求 → Headers → Authorization\n"
                         f"\nFreezeHost Auto Renew",
                         buf,
                     )
-                    raise RuntimeError("OAuth 超时（已发截图）")
+                    raise RuntimeError("Token 登录失败（Token 已失效，需更新 GitHub Secrets）")
+
+                log_info("Token 注入成功")
+
+                # ── OAuth ─────────────────────────────────────
+                try:
+                    page.wait_for_url(re.compile(r"discord\.com/oauth2/authorize"), timeout=6000)
+                    page.wait_for_timeout(2000)
+                    if "discord.com" in page.url:
+                        handle_oauth_page(page)
+                    if "discord.com" in page.url:
+                        try:
+                            page.wait_for_url(re.compile(r"free\.freezehost\.pro"), timeout=20000)
+                        except PlaywrightTimeout:
+                            buf = take_screenshot(page, "oauth-stuck")
+                            send_tg(
+                                f"用户：{display_name}\n"
+                                f"❌ OAuth 授权页卡住，未能跳转回 FreezeHost\n"
+                                f"可能原因: Discord OAuth 页面 DOM 改版 / Token 权限不足 / 网络问题\n"
+                                f"建议: 手动登录一次 https://free.freezehost.pro 完成授权后重试\n"
+                                f"\nFreezeHost Auto Renew",
+                                buf,
+                            )
+                            raise RuntimeError("OAuth 未跳转（已发截图供人工排查）")
+                except PlaywrightTimeout:
+                    if "discord.com" in page.url:
+                        buf = take_screenshot(page, "oauth-timeout")
+                        send_tg(
+                            f"用户：{display_name}\n"
+                            f"❌ OAuth 等待 authorize 页超时\n"
+                            f"当前 URL: {page.url}\n"
+                            f"\nFreezeHost Auto Renew",
+                            buf,
+                        )
+                        raise RuntimeError("OAuth 超时（已发截图）")
 
             # ── Dashboard ─────────────────────────────────
-            try:
-                page.wait_for_url(lambda u: "/callback" in u or "/dashboard" in u, timeout=10000)
-            except PlaywrightTimeout:
-                pass
-            if "/callback" in page.url:
-                page.wait_for_url(re.compile(r"/dashboard"), timeout=15000)
-            if "/dashboard" not in page.url:
-                take_screenshot(page, "not-dashboard")
-                raise RuntimeError("未到达 Dashboard")
+            if not skipped_oauth:
+                try:
+                    page.wait_for_url(lambda u: "/callback" in u or "/dashboard" in u, timeout=10000)
+                except PlaywrightTimeout:
+                    pass
+                if "/callback" in page.url:
+                    page.wait_for_url(re.compile(r"/dashboard"), timeout=15000)
+                if "/dashboard" not in page.url:
+                    take_screenshot(page, "not-dashboard")
+                    raise RuntimeError("未到达 Dashboard")
 
             log_info("登录成功")
 
