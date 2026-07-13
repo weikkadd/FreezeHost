@@ -837,26 +837,42 @@ def run():
                     raise RuntimeError(f"OAuth 后未跳回 FreezeHost, URL: {page.url}")
 
                 # 已回到 FreezeHost, 等待 /submitlogin 自动跳到 /dashboard
-                # 不要在 /submitlogin 页面做 evaluate (会破坏 callback 处理)
-                if "/dashboard" not in page.url:
-                    log_info(f"等待自动跳转到 /dashboard, 当前: {page.url}")
+                # 关键: 不要强制 goto /dashboard! 这会破坏 FreezeHost session 建立
+                # FreezeHost /submitlogin 是后端处理 OAuth code 的页面, 需要时间完成后端调用
+                # 处理完后会自动 302 跳到 /dashboard
+                def is_dashboard_or_logged_in(url):
+                    """判断是否已登录: URL 是 dashboard, 或者已离开 submitlogin/callback/discord"""
+                    if "/dashboard" in url:
+                        return True
+                    # 如果 URL 已经不是 submitlogin/callback/discord, 说明 FreezeHost 已建立 session
+                    if url.startswith("https://free.freezehost.pro/"):
+                        if "/submitlogin" not in url and "/callback" not in url and "/login" not in url:
+                            return True
+                    return False
+
+                if not is_dashboard_or_logged_in(page.url):
+                    log_info(f"等待 /submitlogin 自动跳到 /dashboard, 当前: {page.url}")
                     try:
                         page.wait_for_url(
-                            lambda u: "/dashboard" in u,
-                            timeout=30000,
+                            lambda u: is_dashboard_or_logged_in(u),
+                            timeout=60000,  # 加长到 60s, FreezeHost 后端慢
                         )
-                        log_info(f"已到达 Dashboard: {page.url}")
+                        log_info(f"已到达: {page.url}")
                     except PlaywrightTimeout:
-                        # /submitlogin 没自动跳, 直接 goto /dashboard
-                        # 注意: 必须先等几秒让 FreezeHost 后端处理完 callback 建立session
-                        log_warn(f"callback 未自动跳转, 等 5s 后强制打开 dashboard, 当前: {page.url}")
-                        page.wait_for_timeout(5000)
+                        # /submitlogin 没自动跳, 不要直接 goto dashboard (会被重定向回 Discord OAuth)
+                        # 而是等更久让后端处理, 然后用 JavaScript 检查 cookies / session
+                        log_warn(f"60s 后仍未跳转, 当前: {page.url}")
+                        # 等几秒让后端处理完
+                        page.wait_for_timeout(10000)
+                        # 不强制 goto dashboard, 而是重新打开 FreezeHost 首页
+                        # FreezeHost 会基于 session cookie 判断已登录, 自动跳 dashboard
                         try:
-                            page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=30000)
-                            page.wait_for_timeout(3000)
-                            log_info(f"强制打开 dashboard 后 URL: {page.url}")
+                            log_info(f"尝试重新打开 FreezeHost 首页让 session 自动跳转")
+                            page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+                            page.wait_for_timeout(5000)
+                            log_info(f"重新打开后 URL: {page.url}")
                         except PlaywrightTimeout:
-                            log_warn(f"强制打开 dashboard 超时, 当前: {page.url}")
+                            log_warn(f"重新打开首页也超时, 当前: {page.url}")
 
                 # 最终检查是否到 dashboard
                 if "/dashboard" not in page.url:
@@ -865,6 +881,7 @@ def run():
                         f"用户：{display_name}\n"
                         f"❌ 未到达 Dashboard\n"
                         f"当前 URL: {page.url}\n"
+                        f"OAuth code 已获取但 FreezeHost 未建立 session\n"
                         f"\nFreezeHost Auto Renew",
                         buf,
                     )
