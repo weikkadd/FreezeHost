@@ -900,14 +900,38 @@ def run():
                         except PlaywrightTimeout:
                             log_warn(f"重新打开首页也超时, 当前: {page.url}")
 
-                # 最终检查是否到 dashboard
-                if "/dashboard" not in page.url:
+                # 最终检查登录状态 (不只看 URL, 还看页面元素)
+                # 修复: 之前只判断 URL 含 /dashboard, 但 FreezeHost 可能跳到 / 或其他路径
+                # 改为多维度判断: URL / 页面元素 / 是否有 Login 按钮
+                logged_in = False
+                if is_dashboard_or_logged_in(page.url):
+                    logged_in = True
+                    log_info(f"✅ URL 判断已登录: {page.url}")
+
+                # 双重确认: 检查页面是否有 "Login with Discord" 按钮 (有 = 未登录)
+                if not logged_in:
+                    try:
+                        login_btn = page.locator('span.text-lg:has-text("Login with Discord")')
+                        if login_btn.is_visible(timeout=2000):
+                            log_warn(f"❌ 页面显示 Login with Discord 按钮, 未登录")
+                            logged_in = False
+                        else:
+                            # 没有 Login 按钮, 可能已登录但 URL 不是 /dashboard
+                            log_info("未发现 Login 按钮, 判定为已登录")
+                            logged_in = True
+                    except Exception:
+                        # 找不到按钮也判定为已登录 (FreezeHost 改版可能改了文案)
+                        log_info("无法确认 Login 按钮, 默认判定为已登录")
+                        logged_in = True
+
+                if not logged_in:
                     buf = take_screenshot(page, "not-dashboard")
                     send_tg(
                         f"用户：{display_name}\n"
-                        f"❌ 未到达 Dashboard\n"
+                        f"❌ 未登录成功\n"
                         f"当前 URL: {page.url}\n"
                         f"OAuth code 已获取但 FreezeHost 未建立 session\n"
+                        f"可能原因: IP 被 FreezeHost 永久拉黑 / OAuth 流程异常\n"
                         f"\nFreezeHost Auto Renew",
                         buf,
                     )
