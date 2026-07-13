@@ -1233,15 +1233,17 @@ def run():
                          else merge_screenshots(browser, screenshots) if screenshots
                          else None)
 
-            # ── TG 推送（简洁格式, 参考 Godlike） ──────
+            # ── TG 推送（简洁格式 + 带续期网址） ──────
             lines = []
             for r in results:
                 sid = r['server_id']
+                server_url = f"{BASE_URL}/server-console?id={sid}"
                 # emoji 转 ✓/✗/!
                 simple = "✓" if r['status'] in ('renewed',) else "✗" if r['status'] in ('error', 'broke') else "!"
                 s = f"{simple} 服务器 {sid}: {r['status_label']}"
                 if r["detail"]:
                     s += f" ({r['detail']})"
+                s += f"\n{server_url}"
                 lines.append(s)
 
             now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
