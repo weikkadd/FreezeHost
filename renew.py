@@ -1245,7 +1245,7 @@ def run():
                 lines.append(s)
 
             now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-            send_tg("\n".join([f"账号: {display_name}", *lines, f"时间: {now_str}", "FreezeHost Auto Renew"]), final_img)
+            send_tg("\n".join([f"账号: {display_name}", *lines, f"时间: {now_str}", "FreezeHost Auto Renew"]))
             log_info("所有服务器处理完毕")
 
         except Exception as e:
