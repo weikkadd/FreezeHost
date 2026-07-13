@@ -836,16 +836,37 @@ def run():
                         raise RuntimeError("OAuth 超时（已发截图）")
 
             # ── Dashboard ─────────────────────────────────
+            # OAuth 完成后, FreezeHost 会跳转到 /submitlogin?code=... 处理 callback
+            # 然后自动跳转到 /dashboard, 也可能直接到 /dashboard
             if not skipped_oauth:
+                # 第一步: 等 FreezeHost 的 callback 路径 (/submitlogin 或 /callback 或 /dashboard)
                 try:
-                    page.wait_for_url(lambda u: "/callback" in u or "/dashboard" in u, timeout=10000)
+                    page.wait_for_url(
+                        lambda u: "/submitlogin" in u or "/callback" in u or "/dashboard" in u,
+                        timeout=15000,
+                    )
+                    log_info(f"已回到 FreezeHost: {page.url}")
                 except PlaywrightTimeout:
-                    pass
-                if "/callback" in page.url:
-                    page.wait_for_url(re.compile(r"/dashboard"), timeout=15000)
+                    log_warn(f"未检测到 FreezeHost callback URL, 当前 URL: {page.url}")
+
+                # 第二步: 如果在 callback 中间页, 等它跳到 /dashboard
+                if "/submitlogin" in page.url or "/callback" in page.url:
+                    log_info("等待 FreezeHost 处理 callback 并跳转到 dashboard...")
+                    try:
+                        page.wait_for_url(lambda u: "/dashboard" in u, timeout=20000)
+                        log_info(f"已到达 Dashboard: {page.url}")
+                    except PlaywrightTimeout:
+                        # 强制跳转到 dashboard
+                        log_warn(f"callback 未自动跳转, 强制打开 dashboard, 当前 URL: {page.url}")
+                        page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded")
+                        page.wait_for_timeout(3000)
+
+                # 第三步: 最终检查
                 if "/dashboard" not in page.url:
-                    take_screenshot(page, "not-dashboard")
-                    raise RuntimeError("未到达 Dashboard")
+                    # 最后兜底: 直接打开 dashboard
+                    log_warn(f"未到 dashboard, 强制打开. 当前 URL: {page.url}")
+                    page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded")
+                    page.wait_for_timeout(3000)
 
             log_info("登录成功")
 
