@@ -674,8 +674,25 @@ def run():
                 except Exception as e:
                     log_warn(f"服务条款确认异常: {e}")
 
-                page.wait_for_url(re.compile(r"discord\.com"), timeout=15000)
-                log_info("已到达 Discord")
+                # 等待跳转到 Discord (精确判断域名, 不能只看 URL 含 'discord.com')
+                # 因为 free.freezehost.pro/xxx?ref=discord.com 这种 URL 也会含 'discord.com'
+                try:
+                    page.wait_for_url(lambda u: u.startswith("https://discord.com/") or u.startswith("https://discordapp.com/"), timeout=15000)
+                    log_info(f"已到达 Discord, URL: {page.url}")
+                except PlaywrightTimeout:
+                    # 没跳到 Discord, 截图保存
+                    buf = take_screenshot(page, "not-discord")
+                    current_url = page.url
+                    log_error(f"未跳转到 Discord, 当前 URL: {current_url}")
+                    send_tg(
+                        f"用户：{display_name}\n"
+                        f"❌ 点击登录后未跳转到 Discord\n"
+                        f"当前 URL: {current_url}\n"
+                        f"可能原因: FreezeHost 改版 / 网络问题 / 服务条款未接受\n"
+                        f"\nFreezeHost Auto Renew",
+                        buf,
+                    )
+                    raise RuntimeError(f"未跳转到 Discord, 当前 URL: {current_url}")
 
                 # ── Token 已通过 storage_state 预加载, 只需验证 ───
                 # storage_state 在浏览器启动时就写入了 localStorage, 跳转到 discord.com 后应能读到
@@ -696,6 +713,7 @@ def run():
                     log_warn("等待 localStorage 可用超时, 继续尝试读取")
 
                 page.wait_for_timeout(2000)  # 额外缓冲
+                log_info(f"当前 URL (注入前): {page.url}")
 
                 # 验证 localStorage.token 是否存在
                 try:
@@ -711,16 +729,32 @@ def run():
                     }""")
                     if not stored or 'ERROR' in str(stored):
                         log_error(f"❌ Token 未在 localStorage 中找到: {stored}")
-                        buf = take_screenshot(page, "inject-failed")
-                        send_tg(
-                            f"用户：{display_name}\n"
-                            f"❌ Token 注入失败 (storage_state 未生效)\n"
-                            f"localStorage.token: {stored}\n"
-                            f"当前 URL: {page.url}\n"
-                            f"\nFreezeHost Auto Renew",
-                            buf,
-                        )
-                        raise RuntimeError(f"Token 注入失败, localStorage.token = {stored}")
+                        # 如果 storage_state 没生效, 尝试手动注入作为兜底
+                        log_info("尝试手动注入 Token 作为兜底...")
+                        try:
+                            page.evaluate("""(token) => {
+                                try { window.localStorage.setItem('token', JSON.stringify(token)); } catch(e) {}
+                            }""", DISCORD_TOKEN)
+                            page.wait_for_timeout(1000)
+                            stored = page.evaluate("() => { try { return window.localStorage.getItem('token'); } catch(e) { return null; } }")
+                            if stored:
+                                log_info(f"✅ 手动注入成功, token 长度: {len(stored)}")
+                            else:
+                                log_error("手动注入也失败")
+                        except Exception as e:
+                            log_error(f"手动注入异常: {e}")
+
+                        if not stored or 'ERROR' in str(stored):
+                            buf = take_screenshot(page, "inject-failed")
+                            send_tg(
+                                f"用户：{display_name}\n"
+                                f"❌ Token 注入失败 (storage_state + 手动注入都失败)\n"
+                                f"localStorage.token: {stored}\n"
+                                f"当前 URL: {page.url}\n"
+                                f"\nFreezeHost Auto Renew",
+                                buf,
+                            )
+                            raise RuntimeError(f"Token 注入失败, localStorage.token = {stored}")
                     log_info(f"✅ Token 已在 localStorage 中 (长度 {len(stored)})")
                 except RuntimeError:
                     raise
