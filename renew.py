@@ -679,12 +679,31 @@ def run():
 
                 # ── Token 已通过 storage_state 预加载, 只需验证 ───
                 # storage_state 在浏览器启动时就写入了 localStorage, 跳转到 discord.com 后应能读到
-                page.wait_for_timeout(2000)  # 等页面完全加载
+                # 关键: 必须等页面真正加载完, 否则 window.localStorage 是 undefined
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                except PlaywrightTimeout:
+                    log_warn("等待 domcontentloaded 超时, 继续尝试")
+
+                # 等 window.localStorage 可用 (Discord SPA 早期 localStorage 是 undefined)
+                try:
+                    page.wait_for_function(
+                        "() => { try { return typeof window.localStorage !== 'undefined' && window.localStorage !== null; } catch(e) { return false; } }",
+                        timeout=15000,
+                    )
+                    log_info("localStorage 已可用")
+                except PlaywrightTimeout:
+                    log_warn("等待 localStorage 可用超时, 继续尝试读取")
+
+                page.wait_for_timeout(2000)  # 额外缓冲
 
                 # 验证 localStorage.token 是否存在
                 try:
                     stored = page.evaluate("""() => {
                         try {
+                            if (typeof window.localStorage === 'undefined' || !window.localStorage) {
+                                return 'ERROR: localStorage is undefined';
+                            }
                             return window.localStorage.getItem('token');
                         } catch(e) {
                             return 'ERROR: ' + e.message;
@@ -697,6 +716,7 @@ def run():
                             f"用户：{display_name}\n"
                             f"❌ Token 注入失败 (storage_state 未生效)\n"
                             f"localStorage.token: {stored}\n"
+                            f"当前 URL: {page.url}\n"
                             f"\nFreezeHost Auto Renew",
                             buf,
                         )
