@@ -116,6 +116,7 @@ jobs:
           FREEZEHOST_DISCORD_TOKEN: ${{ env.DISCORD_TOKEN }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TOKEN_NUM: ${{ steps.select_token.outputs.token_number }}
         run: |
           echo "使用 Token 编号: ${{ steps.select_token.outputs.token_number }}"
           python renew.py 2>&1 | tee renew.log

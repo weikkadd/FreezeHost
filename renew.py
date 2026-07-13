@@ -545,22 +545,41 @@ def run():
             log_info("已到达 Discord")
 
             # ── 注入 Token ────────────────────────────────
-            page.evaluate("""(token) => {
-                const f = document.createElement('iframe');
-                f.style.display = 'none';
-                document.body.appendChild(f);
-                f.contentWindow.localStorage.setItem('token', '"'+token+'"');
-                try { localStorage.setItem('token', '"'+token+'"'); } catch(e) {}
-                document.body.removeChild(f);
-            }""", DISCORD_TOKEN)
-            log_info("Token 已注入")
+            # 旧方案：用 iframe.contentWindow.localStorage 注入，
+            #   但 Discord 页面的 CSP / sandbox 会让 contentWindow 为 null，导致抛错。
+            # 新方案：add_init_script 在每个页面加载前注入 localStorage，
+            #   不依赖 iframe，绕过 CSP，且对所有后续跳转也生效。
+            try:
+                page.add_init_script(f"""() => {{
+                    try {{
+                        localStorage.setItem('token', JSON.stringify({json.dumps(DISCORD_TOKEN)}));
+                    }} catch (e) {{}}
+                }}""")
+                log_info("Token init script 已注册")
+            except Exception as e:
+                log_warn(f"add_init_script 注册失败，回退到 evaluate 注入: {e}")
+                try:
+                    page.evaluate("""(token) => {
+                        try { localStorage.setItem('token', '"'+token+'"'); } catch(e) {}
+                    }""", DISCORD_TOKEN)
+                except Exception as e2:
+                    log_error(f"evaluate 注入也失败: {e2}")
 
             page.reload(wait_until="domcontentloaded")
             page.wait_for_timeout(3000)
 
             if re.search(r"discord\.com/login", page.url):
-                take_screenshot(page, "token-failed")
-                raise RuntimeError("Token 登录失败")
+                buf = take_screenshot(page, "token-failed")
+                send_tg(
+                    f"用户：{display_name}\n"
+                    f"❌ Discord Token 已失效\n"
+                    f"请重新获取 Token 并更新 GitHub Secrets:\n"
+                    f"  FREEZEHOST_DISCORD_TOKEN_{int(os.environ.get('TOKEN_NUM', '1'))}\n"
+                    f"教程: 浏览器 F12 → Network → 任意请求 → Headers → Authorization\n"
+                    f"\nFreezeHost Auto Renew",
+                    buf,
+                )
+                raise RuntimeError("Token 登录失败（Token 已失效，需更新 GitHub Secrets）")
 
             log_info("Token 注入成功")
 
@@ -574,11 +593,27 @@ def run():
                     try:
                         page.wait_for_url(re.compile(r"free\.freezehost\.pro"), timeout=20000)
                     except PlaywrightTimeout:
-                        take_screenshot(page, "oauth-stuck")
-                        raise RuntimeError("OAuth 未跳转")
+                        buf = take_screenshot(page, "oauth-stuck")
+                        send_tg(
+                            f"用户：{display_name}\n"
+                            f"❌ OAuth 授权页卡住，未能跳转回 FreezeHost\n"
+                            f"可能原因: Discord OAuth 页面 DOM 改版 / Token 权限不足 / 网络问题\n"
+                            f"建议: 手动登录一次 https://free.freezehost.pro 完成授权后重试\n"
+                            f"\nFreezeHost Auto Renew",
+                            buf,
+                        )
+                        raise RuntimeError("OAuth 未跳转（已发截图供人工排查）")
             except PlaywrightTimeout:
                 if "discord.com" in page.url:
-                    raise RuntimeError("OAuth 超时")
+                    buf = take_screenshot(page, "oauth-timeout")
+                    send_tg(
+                        f"用户：{display_name}\n"
+                        f"❌ OAuth 等待 authorize 页超时\n"
+                        f"当前 URL: {page.url}\n"
+                        f"\nFreezeHost Auto Renew",
+                        buf,
+                    )
+                    raise RuntimeError("OAuth 超时（已发截图）")
 
             # ── Dashboard ─────────────────────────────────
             try:
