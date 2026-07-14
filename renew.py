@@ -1233,22 +1233,15 @@ def run():
                          else merge_screenshots(browser, screenshots) if screenshots
                          else None)
 
-            # ── TG 推送（简洁格式 + 带续期网址） ──────
-            lines = []
+            # ── TG 推送（带 emoji 格式） ──────
+            now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+            lines = [f"🎮FreezeHost 续期通知", f"⏰运行时间: {now_str}", f"🖥️账号: {display_name}"]
             for r in results:
                 sid = r['server_id']
-                server_url = f"{BASE_URL}/server-console?id={sid}"
-                # emoji 转 ✓/✗/!
-                simple = "✓" if r['status'] in ('renewed',) else "✗" if r['status'] in ('error', 'broke') else "!"
-                s = f"{simple} 服务器 {sid}: {r['status_label']}"
-                if r["detail"]:
-                    s += f" ({r['detail']})"
-                s += f"\n{server_url}"
-                lines.append(s)
-
-            now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-            send_tg("\n".join([f"账号: {display_name}", *lines, f"时间: {now_str}", "FreezeHost Auto Renew"]))
-            log_info("所有服务器处理完毕")
+                icon = "✅" if r['status'] in ('renewed',) else "❌" if r['status'] in ('error', 'broke') else "⏳"
+                lines.append(f"🖥️服务器: {sid}")
+                lines.append(f"📊续期结果: {icon}{r['status_label']} {r.get('detail','')}")
+            send_tg("\n".join(lines))
 
         except Exception as e:
             buf = take_screenshot(page, "fatal-error")
