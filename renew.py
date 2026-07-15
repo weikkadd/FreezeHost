@@ -1240,6 +1240,7 @@ def run():
                 sid = r['server_id']
                 icon = "✅" if r['status'] in ('renewed',) else "❌" if r['status'] in ('error', 'broke') else "⏳"
                 lines.append(f"🖥️服务器: {sid}")
+                lines.append(f"🔢剩余时间: {r.get('detail', '')}")
                 lines.append(f"📊续期结果: {icon}{r['status_label']} {r.get('detail','')}")
             send_tg("\n".join(lines))
 
