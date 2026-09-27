@@ -804,11 +804,44 @@ def try_dashboard_renew_modal(page, server_id: str):
             log_info(f"[{server_id}] 点击 Renew Instance 后出现续期链接: {m['href'][:60]}")
             return False, m, "modal-link"
 
+        # 模态框内容是异步加载的: 刚打开时 #renewal-renewable-modal 显示 "Checking...",
+        # 真实的续期状态/按钮要等 AJAX 返回后才渲染 (run54 教训: 等 4 秒就 dump 只能拿到 Checking)
+        renewable_text = ""
+        for _ in range(12):
+            page.wait_for_timeout(2000)
+            try:
+                renewable_text = page.evaluate("""() => {
+                    const el = document.getElementById('renewal-renewable-modal');
+                    return el ? (el.innerText || '').trim() : '';
+                }""") or ""
+            except Exception:
+                renewable_text = ""
+            if renewable_text and not re.search(r"checking|loading", renewable_text, re.I):
+                break
+        log_info(f"[{server_id}] #renewal-renewable-modal 异步加载结果: {renewable_text[:200]}")
+
+        # 异步内容渲染后重新扫描 /renew?id= 链接
+        try:
+            m = page.evaluate(r"""() => {
+                for (const a of document.querySelectorAll('a[href*="renew?id="]')) {
+                    const h = a.getAttribute('href');
+                    if (h && h !== '#') return {href: h, text: 'Renew Instance'};
+                }
+                const mm = (document.body.innerHTML || '').match(/href=["']((?:\.\.)?\/renew\?id=[a-f0-9]{6,})["']/i);
+                return mm ? {href: mm[1], text: 'Renew Instance'} : null;
+            }""")
+        except Exception:
+            m = None
+        if m and m.get("href"):
+            log_info(f"[{server_id}] 异步加载后出现续期链接: {m['href'][:60]}")
+            return False, m, "modal-link"
+
+        if renewable_text and re.search(r"not\s*(?:yet\s*)?(?:renewable|available)|come back|no renewals", renewable_text, re.I):
+            return False, None, f"站点提示暂不可续期: {renewable_text[:100]}"
+
         # 无链接 → 在模态框内找确认动作直接执行。
-        # run52 教训: 模态框打开了, 但其确认元素不是 <button>/<a> (按钮清单里没有),
-        # 文本 dump 的 800 上限只抓到 Timeline 说明段。
-        # 对策: dump 模态框 HTML + 枚举所有可点击元素(cursor-pointer/onclick), 用 JS 内层点击(冒泡到处理器),
-        # coins 余额变化 / 剩余时间增加 / success 文案 作为续期成功信号。
+        # 对策: dump #renewal-renewable-modal 及模态框根容器 HTML, 枚举所有可点击元素(cursor-pointer/onclick),
+        # 用 JS 内层点击(冒泡到处理器), coins 余额变化 / 剩余时间增加 / success 文案 作为续期成功信号。
 
         def _coins():
             try:
@@ -821,28 +854,17 @@ def try_dashboard_renew_modal(page, server_id: str):
         coins_before = _coins()
         log_info(f"[{server_id}] 续期前 coins 余额: {coins_before}")
 
-        # 定位模态框: 含 Timeline & Consequences 的最小可见元素, 上溯最多 3 层把确认按钮(兄弟节点)圈进来
-        inv, html_dump = [], ""
+        # 定位: 以 #renewal-renewable-modal 为锚点, 找到模态框根容器, 枚举其中的可点击元素
+        inv, renew_html, root_html = [], "", ""
         try:
             _d = page.evaluate(r"""() => {
-                let host = null;
-                document.querySelectorAll('div, section').forEach(d => {
-                    const s = getComputedStyle(d);
-                    if (s.display === 'none' || s.visibility === 'hidden') return;
-                    const t = (d.innerText || '');
-                    if (/Timeline & Consequences/i.test(t)) {
-                        if (!host || t.length < (host.innerText || '').length) host = d;
-                    }
-                });
-                if (!host) return null;
-                let root = host;
-                for (let i = 0; i < 3; i++) {
-                    if (!root.parentElement || root.parentElement === document.body) break;
-                    root = root.parentElement;
-                    if ((root.innerText || '').length > 4000) break;
-                }
+                const anchor = document.getElementById('renewal-renewable-modal');
+                if (!anchor) return null;
+                const root = anchor.closest('div[class*="max-w-2xl"], div[class*="rounded-3xl"], div[class*="modal"]')
+                    || anchor.parentElement || anchor;
                 const inv = [];
-                root.querySelectorAll('*').forEach(e => {
+                const scope = root || anchor;
+                scope.querySelectorAll('*').forEach(e => {
                     const s = getComputedStyle(e);
                     if (s.display === 'none' || s.visibility === 'hidden') return;
                     const r = e.getBoundingClientRect();
@@ -865,17 +887,26 @@ def try_dashboard_renew_modal(page, server_id: str):
                     seen.add(k);
                     return true;
                 });
-                return { inv: uniq.slice(0, 25), html: root.outerHTML.replace(/\s+/g, ' ').slice(0, 3500) };
+                return {
+                    renewHtml: (anchor.outerHTML || '').replace(/\s+/g, ' ').slice(0, 1500),
+                    rootHtml: ((root && root.outerHTML) || '').replace(/\s+/g, ' ').slice(0, 3500),
+                    inv: uniq.slice(0, 25),
+                };
             }""")
             if _d:
                 inv = _d.get("inv") or []
-                html_dump = _d.get("html") or ""
+                renew_html = _d.get("renewHtml") or ""
+                root_html = _d.get("rootHtml") or ""
         except Exception as e:
             log_warn(f"[{server_id}] 模态框诊断失败: {e}")
-        if html_dump:
-            log_info(f"[{server_id}] 模态框 HTML: {html_dump[:1800]}")
+        if renew_html:
+            log_info(f"[{server_id}] #renewal-renewable-modal HTML: {renew_html[:1400]}")
+        if root_html:
+            log_info(f"[{server_id}] 模态框根 HTML: {root_html[:1800]}")
         if inv:
             log_info(f"[{server_id}] 模态框可点击元素: {inv}")
+        if not inv and not renew_html:
+            log_warn(f"[{server_id}] 未找到 #renewal-renewable-modal, 模态框可能改版")
 
         # 智能确认: 只点含续期语义的元素, 绝不碰 Delete/Cancel 类; JS 内层 click 冒泡到处理器
         good_re = re.compile(r"renew(?!al\b)|\bconfirm\b|proceed|\bpay\b|i understand|续期", re.I)
@@ -892,20 +923,36 @@ def try_dashboard_renew_modal(page, server_id: str):
                 continue
             try:
                 r = page.evaluate(r"""(want) => {
-                    const els = document.querySelectorAll('*');
-                    for (const e of els) {
-                        if (want.onclick) {
-                            if ((e.getAttribute('onclick') || '') === want.onclick) { e.click(); return {ok: true, tag: e.tagName}; }
-                            continue;
-                        }
+                    const visible = (e) => {
                         const s = getComputedStyle(e);
-                        if (s.display === 'none' || s.visibility === 'hidden') continue;
+                        if (s.display === 'none' || s.visibility === 'hidden') return false;
                         const rect = e.getBoundingClientRect();
-                        if (rect.width < 2 || rect.height < 2) continue;
-                        const tt = (e.innerText || '').trim().replace(/\s+/g, ' ');
-                        if (tt && tt === want.text) { e.click(); return {ok: true, tag: e.tagName}; }
+                        return rect.width >= 2 && rect.height >= 2;
+                    };
+                    if (want.onclick) {
+                        for (const e of document.querySelectorAll('*')) {
+                            if ((e.getAttribute('onclick') || '') === want.onclick) { e.click(); return {ok: true, tag: e.tagName}; }
+                        }
+                        return {ok: false};
                     }
-                    return {ok: false};
+                    let inner = null;
+                    for (const e of document.querySelectorAll('*')) {
+                        if (!visible(e)) continue;
+                        const tt = (e.innerText || '').trim().replace(/\s+/g, ' ');
+                        if (tt && tt === want.text) {
+                            if (!inner || inner.contains(e)) inner = e;
+                        }
+                    }
+                    if (!inner) {
+                        for (const e of document.querySelectorAll('*')) {
+                            if (!visible(e)) continue;
+                            const tt = (e.innerText || '').trim().replace(/\s+/g, ' ');
+                            if (tt && tt.includes(want.text)) { if (!inner || inner.contains(e)) inner = e; }
+                        }
+                    }
+                    if (!inner) return {ok: false};
+                    inner.click();
+                    return {ok: true, tag: inner.tagName};
                 }""", {"text": t, "onclick": onclick if (not t and onclick) else ""})
                 if not (r and r.get("ok")):
                     log_warn(f"[{server_id}] 未在页面中定位到目标元素: {t or onclick}")
