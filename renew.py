@@ -326,8 +326,19 @@ def diagnose_site_down(page) -> str:
             return "OOPS 错误页 (FreezeHost 后端故障)"
         if "service unavailable" in html_lower:
             return "Service Unavailable (FreezeHost 服务不可用)"
+        # Cloudflare 拦截/验证页（优先于通用 error 判断: 出口 IP 被拉黑时是这种, 不是站点故障）
+        if "sorry, you have been blocked" in html_lower or "error 1020" in html_lower or "attention required" in html_lower:
+            return "Cloudflare WAF 拦截页 (出口 IP 被 FreezeHost 拉黑, 需更换 PROXY_URL 节点)"
+        if "just a moment" in html_lower or "checking your browser" in html_lower or "challenge-platform" in html_lower:
+            return "Cloudflare 人机验证页 (当前出口被风控, 需更换 PROXY_URL 节点)"
         if "cloudflare" in html_lower and "error" in html_lower:
-            return "Cloudflare 错误页 (CDN 层故障)"
+            import re as _re2
+            _code = _re2.search(r'[Ee]rror\s*(?:1\d{3}|5\d{2})', html)
+            _title_m = _re2.search(r'<title[^>]*>([^<]+)</title>', html, _re2.IGNORECASE)
+            _detail = _code.group(0) if _code else "CDN 层故障"
+            if _title_m:
+                return f"Cloudflare 错误页 [{_detail}] 标题: {_title_m.group(1).strip()}"
+            return f"Cloudflare 错误页 [{_detail}]"
         if "cf-ray" in html_lower and ("error" in html_lower or "sorry" in html_lower):
             return "Cloudflare 拦截页 (可能被风控)"
 
