@@ -1025,6 +1025,12 @@ def run():
                     )
                     raise RuntimeError("找不到登录按钮, FreezeHost 可能改版")
 
+                # 预先注册弹窗监听 (必须在 click 之前, 才能捕获秒开秒关的 OAuth 弹窗)
+                popup_pages = []
+                def _on_popup(p):
+                    popup_pages.append(p)
+                page.context.on("page", _on_popup)
+
                 btn.click()
                 log_info("已点击登录按钮")
 
@@ -1045,41 +1051,84 @@ def run():
                     except Exception:
                         return ""
 
-                # 等待进入 Discord: 主页面跳转 或 新弹窗 (站点常用 window.open 打开 OAuth)
-                # 不能只 wait_for_url 当前页 — 弹窗流程下当前页永远停在首页
+                # 等待进入 Discord 或 OAuth 自动完成
+                # 弹窗可能秒开秒关: 结合 context.pages 实时扫描 + click 前注册的 popup_pages 兜底
                 main_page = page
                 discord_page = None
-                for _ in range(20):  # 最多 20 秒
-                    cur = _safe_url(page)
-                    if cur.startswith("https://discord.com/") or cur.startswith("https://discordapp.com/"):
-                        discord_page = page
-                        break
-                    for np in page.context.pages:
-                        if np is page:
+                auto_done = False
+                seen_urls = set()
+                for _ in range(25):  # 最多 25 秒
+                    candidates = [page] + popup_pages + list(page.context.pages)
+                    checked = []
+                    for np in candidates:
+                        if not any(np is c for c in checked):
+                            checked.append(np)
+                    for p in checked:
+                        u = _safe_url(p)
+                        if not u:
                             continue
-                        npu = _safe_url(np)
-                        if npu.startswith("https://discord.com/") or npu.startswith("https://discordapp.com/"):
-                            discord_page = np
+                        seen_urls.add(u)
+                        if u.startswith("https://discord.com/") or u.startswith("https://discordapp.com/"):
+                            discord_page = p
                             break
-                    if discord_page:
+                        if p is not main_page and u.startswith("https://free.freezehost.pro/") and (
+                            "/submitlogin" in u or "/callback" in u or "/dashboard" in u
+                        ):
+                            auto_done = True
+                            discord_page = p
+                            break
+                    if discord_page or auto_done:
+                        break
+                    # 主页面直接变成 dashboard (站点刷新 opener 的情况)
+                    if "/dashboard" in _safe_url(main_page):
+                        auto_done = True
+                        discord_page = main_page
                         break
                     page.wait_for_timeout(1000)
+                page.context.remove_listener("page", _on_popup)
 
-                if discord_page is None:
+                if discord_page is None and not auto_done:
+                    # 诊断信息: 所有页面 URL / 出现过的 URL / 是否有 Turnstile 人机验证
+                    diag_lines = [f"打开的页面数: {len(page.context.pages)}"]
+                    for p in page.context.pages:
+                        diag_lines.append(f"  - {_safe_url(p) or '(无法获取 URL)'}")
+                    if seen_urls:
+                        diag_lines.append(f"  出现过的 URL: {sorted(seen_urls)[:6]}")
+                    try:
+                        if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
+                            diag_lines.append("  ⚠️ 检测到 Cloudflare Turnstile 人机验证, Actions 无法自动过盾")
+                    except Exception:
+                        pass
+                    _diag = "\n".join(diag_lines)
+                    log_error(_diag)
                     buf = take_screenshot(page, "not-discord")
                     current_url = _safe_url(page)
-                    log_error(f"未跳转到 Discord, 当前 URL: {current_url}")
                     send_tg(
                         f"用户：{display_name}\n"
                         f"❌ 点击登录后未跳转到 Discord\n"
                         f"当前 URL: {current_url}\n"
-                        f"可能原因: FreezeHost 改版 / 网络问题 / 服务条款未接受\n"
+                        f"{_diag}\n"
                         f"\nFreezeHost Auto Renew",
                         buf,
                     )
                     raise RuntimeError(f"未跳转到 Discord, 当前 URL: {current_url}")
 
-                if discord_page is not main_page:
+                if auto_done:
+                    # OAuth 弹窗自动完成 (或主页面已进 dashboard): 回主页面确认登录态
+                    log_info(f"OAuth 已自动完成, URL 历史: {sorted(seen_urls)[:6]}")
+                    if discord_page is not None and discord_page is not main_page:
+                        try:
+                            discord_page.close()
+                        except Exception:
+                            pass
+                    page = main_page
+                    try:
+                        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+                        page.wait_for_timeout(5000)
+                        log_info(f"重新打开首页确认登录态: {_safe_url(page)}")
+                    except Exception as e:
+                        log_warn(f"重新打开首页失败: {e}")
+                elif discord_page is not main_page:
                     log_info(f"检测到 OAuth 弹窗, 后续流程在弹窗内进行, URL: {_safe_url(discord_page)}")
                     page = discord_page
                 log_info(f"已到达 Discord, URL: {_safe_url(page)}")
