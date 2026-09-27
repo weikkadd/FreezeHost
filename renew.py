@@ -804,77 +804,135 @@ def try_dashboard_renew_modal(page, server_id: str):
             log_info(f"[{server_id}] 点击 Renew Instance 后出现续期链接: {m['href'][:60]}")
             return False, m, "modal-link"
 
-        # 无链接 → 在模态框内找确认按钮直接点。
-        # 先 dump 模态框内所有可见按钮文本 (run48 教训: 模态框打开了但确认按钮名未知, 只 dump 到说明文字)
-        btn_texts = []
-        try:
-            btn_texts = page.evaluate(r"""() => {
-                const out = [];
-                document.querySelectorAll('button, a, [role=button]').forEach(b => {
-                    const s = getComputedStyle(b);
-                    if (s.display === 'none' || s.visibility === 'hidden') return;
-                    const r = b.getBoundingClientRect();
-                    if (r.width < 2 || r.height < 2) return;
-                    const t = (b.innerText || '').trim().replace(/\s+/g, ' ');
-                    if (t && t.length < 60) out.push(t);
-                });
-                return [...new Set(out)].slice(0, 30);
-            }""") or []
-        except Exception:
-            pass
-        if btn_texts:
-            log_info(f"[{server_id}] 模态框/页面可见按钮: {btn_texts}")
+        # 无链接 → 在模态框内找确认动作直接执行。
+        # run52 教训: 模态框打开了, 但其确认元素不是 <button>/<a> (按钮清单里没有),
+        # 文本 dump 的 800 上限只抓到 Timeline 说明段。
+        # 对策: dump 模态框 HTML + 枚举所有可点击元素(cursor-pointer/onclick), 用 JS 内层点击(冒泡到处理器),
+        # coins 余额变化 / 剩余时间增加 / success 文案 作为续期成功信号。
 
-        # 智能确认: 只点含续期语义的按钮, 绝不碰 Delete/Cancel 类
-        good_re = re.compile(r"renew(?!al\s*&)|\bconfirm\b|proceed|\bpay\b|i understand|续期", re.I)
-        bad_re = re.compile(r"cancel|close|later|no thanks|delete|dismiss|never|back|sign out|logout", re.I)
-        candidates = [t for t in btn_texts if good_re.search(t) and not bad_re.search(t)]
-        # 排除导航类 "Renew Instance" 外层按钮同名重复 (点击它会再次打开模态框, 无副作用但浪费时间)
-        if not candidates:
-            log_warn(f"[{server_id}] 可见按钮中无续期确认按钮: {btn_texts}")
-        for t in candidates[:3]:
+        def _coins():
             try:
-                cb = page.locator(f'button:has-text("{t[:30]}"), a:has-text("{t[:30]}"), [role=button]:has-text("{t[:30]}")').last
-                if cb.count() == 0 or not cb.is_visible(timeout=1000):
+                m = re.search(r"AVAILABLE BALANCE\s*(\d+)",
+                              page.evaluate("() => document.body.innerText || ''") or "", re.I)
+                return int(m.group(1)) if m else None
+            except Exception:
+                return None
+
+        coins_before = _coins()
+        log_info(f"[{server_id}] 续期前 coins 余额: {coins_before}")
+
+        # 定位模态框: 含 Timeline & Consequences 的最小可见元素, 上溯最多 3 层把确认按钮(兄弟节点)圈进来
+        inv, html_dump = [], ""
+        try:
+            _d = page.evaluate(r"""() => {
+                let host = null;
+                document.querySelectorAll('div, section').forEach(d => {
+                    const s = getComputedStyle(d);
+                    if (s.display === 'none' || s.visibility === 'hidden') return;
+                    const t = (d.innerText || '');
+                    if (/Timeline & Consequences/i.test(t)) {
+                        if (!host || t.length < (host.innerText || '').length) host = d;
+                    }
+                });
+                if (!host) return null;
+                let root = host;
+                for (let i = 0; i < 3; i++) {
+                    if (!root.parentElement || root.parentElement === document.body) break;
+                    root = root.parentElement;
+                    if ((root.innerText || '').length > 4000) break;
+                }
+                const inv = [];
+                root.querySelectorAll('*').forEach(e => {
+                    const s = getComputedStyle(e);
+                    if (s.display === 'none' || s.visibility === 'hidden') return;
+                    const r = e.getBoundingClientRect();
+                    if (r.width < 2 || r.height < 2) return;
+                    const clickable = e.tagName === 'BUTTON' || e.tagName === 'A' || e.getAttribute('onclick')
+                        || e.getAttribute('role') === 'button' || s.cursor === 'pointer';
+                    if (!clickable) return;
+                    const t = (e.innerText || '').trim().replace(/\s+/g, ' ');
+                    inv.push({
+                        tag: e.tagName,
+                        text: t.slice(0, 50),
+                        onclick: (e.getAttribute('onclick') || '').slice(0, 90),
+                        cls: (e.className || '').toString().slice(0, 60),
+                    });
+                });
+                const seen = new Set();
+                const uniq = inv.filter(x => {
+                    const k = (x.text || '|') + '|' + x.onclick;
+                    if (seen.has(k)) return false;
+                    seen.add(k);
+                    return true;
+                });
+                return { inv: uniq.slice(0, 25), html: root.outerHTML.replace(/\s+/g, ' ').slice(0, 3500) };
+            }""")
+            if _d:
+                inv = _d.get("inv") or []
+                html_dump = _d.get("html") or ""
+        except Exception as e:
+            log_warn(f"[{server_id}] 模态框诊断失败: {e}")
+        if html_dump:
+            log_info(f"[{server_id}] 模态框 HTML: {html_dump[:1800]}")
+        if inv:
+            log_info(f"[{server_id}] 模态框可点击元素: {inv}")
+
+        # 智能确认: 只点含续期语义的元素, 绝不碰 Delete/Cancel 类; JS 内层 click 冒泡到处理器
+        good_re = re.compile(r"renew(?!al\b)|\bconfirm\b|proceed|\bpay\b|i understand|续期", re.I)
+        bad_re = re.compile(r"cancel|close|later|no thanks|delete|dismiss|never|back|sign out|logout|timeline", re.I)
+        # 模态框/portal 容器里的候选优先 (外层同名 "Renew Instance" 按钮点开的是同一个模态框, 排后面)
+        inv.sort(key=lambda x: 0 if re.search(r"modal|dialog|portal|overlay", x.get("cls") or "", re.I) else 1)
+
+        for item in inv:
+            t = (item.get("text") or "").strip()
+            onclick = item.get("onclick") or ""
+            if not (good_re.search(t) or good_re.search(onclick)):
+                continue
+            if bad_re.search(t):
+                continue
+            try:
+                r = page.evaluate(r"""(want) => {
+                    const els = document.querySelectorAll('*');
+                    for (const e of els) {
+                        if (want.onclick) {
+                            if ((e.getAttribute('onclick') || '') === want.onclick) { e.click(); return {ok: true, tag: e.tagName}; }
+                            continue;
+                        }
+                        const s = getComputedStyle(e);
+                        if (s.display === 'none' || s.visibility === 'hidden') continue;
+                        const rect = e.getBoundingClientRect();
+                        if (rect.width < 2 || rect.height < 2) continue;
+                        const tt = (e.innerText || '').trim().replace(/\s+/g, ' ');
+                        if (tt && tt === want.text) { e.click(); return {ok: true, tag: e.tagName}; }
+                    }
+                    return {ok: false};
+                }""", {"text": t, "onclick": onclick if (not t and onclick) else ""})
+                if not (r and r.get("ok")):
+                    log_warn(f"[{server_id}] 未在页面中定位到目标元素: {t or onclick}")
                     continue
-                cb.dispatch_event("click")
-                log_info(f"[{server_id}] 已点击模态框确认按钮 '{t}' (dispatch_event)")
-                renewed = False
+                log_info(f"[{server_id}] 已点击模态框确认元素 '{t or onclick[:60]}' <{r.get('tag')}> (JS click)")
                 for _ in range(12):
                     page.wait_for_timeout(2500)
                     u = page.url or ""
                     body = page.evaluate("() => document.body.innerText || ''") or ""
                     left_now = normalize_left_text(body)
                     if "success=RENEWED" in u or re.search(r"renewed|successfully renewed", body, re.I):
-                        return True, None, f"点击 '{t}' 后续期成功"
+                        return True, None, f"点击 '{t or onclick[:40]}' 后续期成功"
+                    coins_now = _coins()
+                    if coins_before is not None and coins_now is not None and coins_now <= coins_before - 10:
+                        return True, None, f"coins {coins_before}→{coins_now}, 续期成功"
                     if left_now:
                         d = remaining_total_days(left_now) or 0
                         if d > 8:
                             return True, None, f"剩余时间变为 {left_now}, 续期成功"
                     if re.search(r"not enough|insufficient", body, re.I):
                         return False, None, "coins 不足, 续期被拒"
-                log_warn(f"[{server_id}] 点击 '{t}' 后未见明确结果, 继续尝试其他按钮")
+                log_warn(f"[{server_id}] 点击 '{t or onclick[:40]}' 后未见明确结果, 继续尝试其他元素")
             except Exception as e:
-                log_warn(f"[{server_id}] 点击 '{t}' 异常: {e}")
+                log_warn(f"[{server_id}] 点击 '{t or onclick[:40]}' 异常: {e}")
                 continue
 
-        # 诊断: dump 可见的 Renewal 模态框文本
-        try:
-            mtext = page.evaluate(r"""() => {
-                let best = '';
-                document.querySelectorAll('div, section').forEach(d => {
-                    const s = getComputedStyle(d);
-                    if (s.display === 'none' || s.visibility === 'hidden') return;
-                    const t = (d.innerText || '');
-                    if (/renew/i.test(t) && t.length < 800 && t.length > best.length) best = t;
-                });
-                return best.replace(/\s+/g, ' ').slice(0, 400);
-            }""")
-            if mtext:
-                log_info(f"[{server_id}] Renewal 模态框内容: {mtext}")
-        except Exception:
-            pass
-        return False, None, "模态框内无确认按钮也无续期链接"
+        return False, None, "模态框内未找到可执行的续期确认 (详见模态框 HTML dump)"
     except Exception as e:
         log_warn(f"[{server_id}] dashboard 续期尝试异常: {e}")
         return False, None, f"异常: {e}"
