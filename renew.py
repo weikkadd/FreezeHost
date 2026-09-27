@@ -1039,15 +1039,35 @@ def run():
                 except Exception as e:
                     log_warn(f"服务条款确认异常: {e}")
 
-                # 等待跳转到 Discord (精确判断域名, 不能只看 URL 含 'discord.com')
-                # 因为 free.freezehost.pro/xxx?ref=discord.com 这种 URL 也会含 'discord.com'
-                try:
-                    page.wait_for_url(lambda u: u.startswith("https://discord.com/") or u.startswith("https://discordapp.com/"), timeout=15000)
-                    log_info(f"已到达 Discord, URL: {page.url}")
-                except PlaywrightTimeout:
-                    # 没跳到 Discord, 截图保存
+                def _safe_url(p):
+                    try:
+                        return p.url or ""
+                    except Exception:
+                        return ""
+
+                # 等待进入 Discord: 主页面跳转 或 新弹窗 (站点常用 window.open 打开 OAuth)
+                # 不能只 wait_for_url 当前页 — 弹窗流程下当前页永远停在首页
+                main_page = page
+                discord_page = None
+                for _ in range(20):  # 最多 20 秒
+                    cur = _safe_url(page)
+                    if cur.startswith("https://discord.com/") or cur.startswith("https://discordapp.com/"):
+                        discord_page = page
+                        break
+                    for np in page.context.pages:
+                        if np is page:
+                            continue
+                        npu = _safe_url(np)
+                        if npu.startswith("https://discord.com/") or npu.startswith("https://discordapp.com/"):
+                            discord_page = np
+                            break
+                    if discord_page:
+                        break
+                    page.wait_for_timeout(1000)
+
+                if discord_page is None:
                     buf = take_screenshot(page, "not-discord")
-                    current_url = page.url
+                    current_url = _safe_url(page)
                     log_error(f"未跳转到 Discord, 当前 URL: {current_url}")
                     send_tg(
                         f"用户：{display_name}\n"
@@ -1058,6 +1078,11 @@ def run():
                         buf,
                     )
                     raise RuntimeError(f"未跳转到 Discord, 当前 URL: {current_url}")
+
+                if discord_page is not main_page:
+                    log_info(f"检测到 OAuth 弹窗, 后续流程在弹窗内进行, URL: {_safe_url(discord_page)}")
+                    page = discord_page
+                log_info(f"已到达 Discord, URL: {_safe_url(page)}")
 
                 # ── 关键: Discord OAuth 页面处理 ──
                 # 即使 URL 含 prompt=none, Discord 仍可能显示 Authorize 按钮需要点击
@@ -1114,25 +1139,35 @@ def run():
                     buf = take_screenshot(page, "no-authorize-btn")
                     log_info(f"当前 URL: {page.url}")
 
-                # 等待跳转回 FreezeHost (精确判断, 不能只看 URL 含 'free.freezehost.pro' 因为 redirect_uri 也含)
-                # 必须是 URL 以 https://free.freezehost.pro 开头
+                # 等待跳回 FreezeHost: 弹窗内完成授权后可能关闭弹窗, 由主页面接管
                 try:
                     page.wait_for_url(
                         lambda u: u.startswith("https://free.freezehost.pro/"),
                         timeout=30000,
                     )
-                    log_info(f"已跳回 FreezeHost: {page.url}")
-                except PlaywrightTimeout:
-                    buf = take_screenshot(page, "oauth-stuck")
-                    send_tg(
-                        f"用户：{display_name}\n"
-                        f"❌ OAuth 完成后未跳回 FreezeHost\n"
-                        f"当前 URL: {page.url}\n"
-                        f"是否点击 Authorize: {authorize_clicked}\n"
-                        f"\nFreezeHost Auto Renew",
-                        buf,
-                    )
-                    raise RuntimeError(f"OAuth 后未跳回 FreezeHost, URL: {page.url}")
+                    log_info(f"已跳回 FreezeHost: {_safe_url(page)}")
+                except Exception:
+                    # 弹窗可能已关闭 (TargetClosed) 或超时 — 检查主页面是否已接管
+                    mu = _safe_url(main_page)
+                    if main_page is not page and mu.startswith("https://free.freezehost.pro/"):
+                        log_info(f"弹窗已关闭, 主页面已回到 FreezeHost: {mu}")
+                        page = main_page
+                    else:
+                        buf = None
+                        try:
+                            buf = take_screenshot(page, "oauth-stuck")
+                        except Exception:
+                            pass
+                        _cur = _safe_url(page) or "(页面已关闭)"
+                        send_tg(
+                            f"用户：{display_name}\n"
+                            f"❌ OAuth 完成后未跳回 FreezeHost\n"
+                            f"当前 URL: {_cur}\n"
+                            f"是否点击 Authorize: {authorize_clicked}\n"
+                            f"\nFreezeHost Auto Renew",
+                            buf,
+                        )
+                        raise RuntimeError(f"OAuth 后未跳回 FreezeHost, URL: {_cur}")
 
                 # 已回到 FreezeHost, 等待 /submitlogin 自动跳到 /dashboard
                 # 关键: 不要强制 goto /dashboard! 这会破坏 FreezeHost session 建立
@@ -1148,18 +1183,32 @@ def run():
                             return True
                     return False
 
-                if not is_dashboard_or_logged_in(page.url):
-                    log_info(f"等待 /submitlogin 自动跳到 /dashboard, 当前: {page.url}")
+                # 弹窗可能在到达 dashboard 后被站点关闭, 主页面接管
+                if page is not main_page and not _safe_url(page):
+                    mu = _safe_url(main_page)
+                    if mu.startswith("https://free.freezehost.pro/"):
+                        log_info(f"弹窗已关闭, 切回主页面: {mu}")
+                        page = main_page
+                if not is_dashboard_or_logged_in(_safe_url(page)):
+                    log_info(f"等待 /submitlogin 自动跳到 /dashboard, 当前: {_safe_url(page)}")
                     try:
                         page.wait_for_url(
                             lambda u: is_dashboard_or_logged_in(u),
                             timeout=60000,  # 加长到 60s, FreezeHost 后端慢
                         )
-                        log_info(f"已到达: {page.url}")
-                    except PlaywrightTimeout:
+                        log_info(f"已到达: {_safe_url(page)}")
+                    except Exception:
+                        # 弹窗可能中途被关闭, 主页面接管
+                        if page is not main_page and not _safe_url(page):
+                            mu = _safe_url(main_page)
+                            if mu.startswith("https://free.freezehost.pro/"):
+                                log_info(f"弹窗已关闭, 切回主页面: {mu}")
+                                page = main_page
+                            else:
+                                raise
                         # /submitlogin 没自动跳, 不要直接 goto dashboard (会被重定向回 Discord OAuth)
                         # 而是等更久让后端处理, 然后用 JavaScript 检查 cookies / session
-                        log_warn(f"60s 后仍未跳转, 当前: {page.url}")
+                        log_warn(f"60s 后仍未跳转, 当前: {_safe_url(page)}")
                         # 等几秒让后端处理完
                         page.wait_for_timeout(10000)
                         # 不强制 goto dashboard, 而是重新打开 FreezeHost 首页
@@ -1168,17 +1217,17 @@ def run():
                             log_info(f"尝试重新打开 FreezeHost 首页让 session 自动跳转")
                             page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
                             page.wait_for_timeout(5000)
-                            log_info(f"重新打开后 URL: {page.url}")
-                        except PlaywrightTimeout:
-                            log_warn(f"重新打开首页也超时, 当前: {page.url}")
+                            log_info(f"重新打开后 URL: {_safe_url(page)}")
+                        except Exception:
+                            log_warn(f"重新打开首页也超时, 当前: {_safe_url(page)}")
 
                 # 最终检查登录状态 (不只看 URL, 还看页面元素)
                 # 修复: 之前只判断 URL 含 /dashboard, 但 FreezeHost 可能跳到 / 或其他路径
                 # 改为多维度判断: URL / 页面元素 / 是否有 Login 按钮
                 logged_in = False
-                if is_dashboard_or_logged_in(page.url):
+                if is_dashboard_or_logged_in(_safe_url(page)):
                     logged_in = True
-                    log_info(f"✅ URL 判断已登录: {page.url}")
+                    log_info(f"✅ URL 判断已登录: {_safe_url(page)}")
 
                 # 双重确认: 检查页面是否有 "Login with Discord" 按钮 (有 = 未登录)
                 if not logged_in:
@@ -1212,7 +1261,7 @@ def run():
                 # 等 dashboard 完全渲染
                 try:
                     page.wait_for_load_state("networkidle", timeout=30000)
-                except PlaywrightTimeout:
+                except Exception:
                     log_warn("dashboard networkidle 超时, 继续")
                 page.wait_for_timeout(3000)
 
