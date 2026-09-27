@@ -1206,6 +1206,67 @@ def process_server(page, server_id: str, renew_links: dict | None = None, dashbo
         except PlaywrightTimeout:
             pass
 
+        # 新版站点在 /renew?id= 后加了两道验证 (run57 截图): ① 点击指定颜色的形状 ② Cloudflare Turnstile
+        try:
+            _body = page.evaluate("() => document.body.innerText || ''") or ""
+            if re.search(r"SECURITY VERIFICATION|Click or tap the|Complete Verification", _body, re.I):
+                log_info(f"[{server_id}] 续期页出现交互验证, 尝试自动完成...")
+                # ① 解析要点击的形状名 ("Click or tap the Cyan Cube below:")
+                target = page.evaluate(r"""() => {
+                    const m = (document.body.innerText || '').match(/Click or tap the\s+([A-Za-z]+)\s+([A-Za-z]+)/i);
+                    return m ? (m[1] + ' ' + m[2]).trim() : null;
+                }""")
+                log_info(f"[{server_id}] 验证目标形状: {target}")
+                if target:
+                    clicked = page.evaluate(r"""(name) => {
+                        let best = null;
+                        for (const e of document.querySelectorAll('*')) {
+                            const t = (e.innerText || '').trim();
+                            const r = e.getBoundingClientRect();
+                            if (!t || t.length > 40 || r.width < 5) continue;
+                            const s = getComputedStyle(e);
+                            if (s.display === 'none' || s.visibility === 'hidden') continue;
+                            if (t.toLowerCase().includes(name.toLowerCase())) {
+                                if (!best || best.contains(e)) best = e;
+                            }
+                        }
+                        if (best) { best.click(); return best.tagName + ':' + (best.innerText || '').trim(); }
+                        return null;
+                    }""", target)
+                    log_info(f"[{server_id}] 已点击验证形状: {clicked}")
+                    page.wait_for_timeout(2500)
+                # ② 等 Turnstile token (managed 模式下干净指纹的浏览器可能自动通过)
+                token = ""
+                for _ in range(10):
+                    page.wait_for_timeout(3000)
+                    token = page.evaluate(r"""() => {
+                        const i = document.querySelector('input[name="cf-turnstile-response"]');
+                        return i ? (i.value || '') : '';
+                    }""") or ""
+                    if token:
+                        break
+                log_info(f"[{server_id}] Turnstile token: {'已获取 (' + str(len(token)) + ' 字符)' if token else '未获取 (无法自动过盾)'}")
+                # ③ 点完成按钮 (token 到位后按钮才会解锁)
+                done = page.evaluate(r"""() => {
+                    for (const e of document.querySelectorAll('button, a, [role=button]')) {
+                        const t = (e.innerText || '').trim();
+                        if (/complete verification/i.test(t)) {
+                            const s = getComputedStyle(e);
+                            if (s.display === 'none' || s.visibility === 'hidden') continue;
+                            e.click();
+                            return t;
+                        }
+                    }
+                    return null;
+                }""")
+                log_info(f"[{server_id}] 已点击完成验证按钮: {done}")
+                try:
+                    page.wait_for_url(lambda u: "/dashboard" in u or "/server-console" in u or "success" in u.lower(), timeout=30000)
+                except PlaywrightTimeout:
+                    pass
+        except Exception as e:
+            log_warn(f"[{server_id}] 验证页处理异常: {e}")
+
         url = page.url
         if "success=RENEWED" in url:
             log_info(f"[{server_id}] 续期成功！")
@@ -1228,7 +1289,10 @@ def process_server(page, server_id: str, renew_links: dict | None = None, dashbo
             result.update(status="tooearly", emoji="⏳", status_label="冷却期",
                           detail=remaining_before or "")
         else:
-            result.update(status="unknown", emoji="❓", status_label="结果未知")
+            result.update(status="unknown", emoji="❓", status_label="结果未知", detail=url[:70])
+            log_warn(f"[{server_id}] 续期落点 URL: {url[:150]}")
+            body_now = page.evaluate("() => (document.body.innerText || '').replace(/\\s+/g, ' ').slice(0, 200)")
+            log_warn(f"[{server_id}] 落点页面文本: {body_now}")
 
     except Exception as e:
         log_error(f"[{server_id}] 异常: {e}")
@@ -1931,7 +1995,7 @@ def run():
 
             # ── TG 推送（带 emoji 格式） ──────
             # 固定每日运行后: 纯冷却期不再推送 (免得每天刷屏), 只推送有动作/异常的结果
-            actionable = [r for r in results if r.get("status") in ("renewed", "error", "broke")]
+            actionable = [r for r in results if r.get("status") in ("renewed", "error", "broke", "unknown")]
             if not actionable:
                 summary = "; ".join(f"{r['server_id']}:{r['status']}({r.get('detail', '')})" for r in results)
                 log_info(f"全部服务器处于冷却期, 跳过 TG 推送: {summary}")
