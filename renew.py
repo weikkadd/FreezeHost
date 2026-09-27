@@ -804,19 +804,42 @@ def try_dashboard_renew_modal(page, server_id: str):
             log_info(f"[{server_id}] 点击 Renew Instance 后出现续期链接: {m['href'][:60]}")
             return False, m, "modal-link"
 
-        # 无链接 → 找模态框确认按钮直接点
-        for sel in ('button:has-text("Confirm Renew")', 'button:has-text("Confirm")',
-                    'button:has-text("Renew Now")', 'button:has-text("Pay")',
-                    'button:has-text("Yes")', 'button:has-text("Continue")'):
+        # 无链接 → 在模态框内找确认按钮直接点。
+        # 先 dump 模态框内所有可见按钮文本 (run48 教训: 模态框打开了但确认按钮名未知, 只 dump 到说明文字)
+        btn_texts = []
+        try:
+            btn_texts = page.evaluate(r"""() => {
+                const out = [];
+                document.querySelectorAll('button, a, [role=button]').forEach(b => {
+                    const s = getComputedStyle(b);
+                    if (s.display === 'none' || s.visibility === 'hidden') return;
+                    const r = b.getBoundingClientRect();
+                    if (r.width < 2 || r.height < 2) return;
+                    const t = (b.innerText || '').trim().replace(/\s+/g, ' ');
+                    if (t && t.length < 60) out.push(t);
+                });
+                return [...new Set(out)].slice(0, 30);
+            }""") or []
+        except Exception:
+            pass
+        if btn_texts:
+            log_info(f"[{server_id}] 模态框/页面可见按钮: {btn_texts}")
+
+        # 智能确认: 只点含续期语义的按钮, 绝不碰 Delete/Cancel 类
+        good_re = re.compile(r"renew(?!al\s*&)|\bconfirm\b|proceed|\bpay\b|i understand|续期", re.I)
+        bad_re = re.compile(r"cancel|close|later|no thanks|delete|dismiss|never|back|sign out|logout", re.I)
+        candidates = [t for t in btn_texts if good_re.search(t) and not bad_re.search(t)]
+        # 排除导航类 "Renew Instance" 外层按钮同名重复 (点击它会再次打开模态框, 无副作用但浪费时间)
+        if not candidates:
+            log_warn(f"[{server_id}] 可见按钮中无续期确认按钮: {btn_texts}")
+        for t in candidates[:3]:
             try:
-                cb = page.locator(sel).last
+                cb = page.locator(f'button:has-text("{t[:30]}"), a:has-text("{t[:30]}"), [role=button]:has-text("{t[:30]}")').last
                 if cb.count() == 0 or not cb.is_visible(timeout=1000):
-                    continue
-                t = (cb.inner_text() or "").strip()
-                if any(k in t.lower() for k in ("cancel", "close", "later", "no thanks", "delete")):
                     continue
                 cb.dispatch_event("click")
                 log_info(f"[{server_id}] 已点击模态框确认按钮 '{t}' (dispatch_event)")
+                renewed = False
                 for _ in range(12):
                     page.wait_for_timeout(2500)
                     u = page.url or ""
@@ -830,8 +853,9 @@ def try_dashboard_renew_modal(page, server_id: str):
                             return True, None, f"剩余时间变为 {left_now}, 续期成功"
                     if re.search(r"not enough|insufficient", body, re.I):
                         return False, None, "coins 不足, 续期被拒"
-                return False, None, f"点击 '{t}' 后未见成功/失败提示"
-            except Exception:
+                log_warn(f"[{server_id}] 点击 '{t}' 后未见明确结果, 继续尝试其他按钮")
+            except Exception as e:
+                log_warn(f"[{server_id}] 点击 '{t}' 异常: {e}")
                 continue
 
         # 诊断: dump 可见的 Renewal 模态框文本

@@ -32,6 +32,7 @@ jobs:
     permissions:
       contents: write
       actions: write
+      workflows: write
 
     steps:
       - name: 确定使用哪个 Token
