@@ -1097,13 +1097,14 @@ def run():
                     popup_pages.append(p)
                 page.context.on("page", _on_popup)
 
+                # 用 dispatch_event 直接向按钮派发点击事件:
+                # 物理点击会被锚定广告遮挡/被广告劫持器截胡(第一次点击弹广告), dispatch 直达站点自己的 OAuth 处理器
                 try:
-                    btn.click(timeout=8000)
-                except Exception:
-                    # 被广告/遮罩层挡住时, 直接向按钮派发点击事件 (绕过遮挡)
-                    log_warn("常规点击被遮挡, 改用 dispatch_event 直接触发按钮点击")
                     btn.dispatch_event("click")
-                log_info("已点击登录按钮")
+                    log_info("已点击登录按钮 (dispatch_event, 绕过广告遮挡与劫持)")
+                except Exception:
+                    btn.click(timeout=8000)
+                    log_info("已点击登录按钮 (常规点击)")
 
                 # 等待可能出现的「服务条款确认」对话框
                 try:
@@ -1135,8 +1136,9 @@ def run():
                         try:
                             lb = find_login_button(page)
                             if lb:
-                                lb.click()
-                                log_info(f"第 {click_round + 1} 次点击登录按钮 (累计关闭广告弹窗 {ads_closed} 个)")
+                                # 同样用 dispatch_event, 绕过锚定广告/遮罩层的物理点击拦截
+                                lb.dispatch_event("click")
+                                log_info(f"第 {click_round + 1} 次点击登录按钮 (dispatch_event, 累计关闭广告弹窗 {ads_closed} 个)")
                         except Exception as e:
                             log_warn(f"重新点击登录按钮失败: {e}")
                     ads_this_round = 0
