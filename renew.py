@@ -1052,54 +1052,83 @@ def run():
                         return ""
 
                 # 等待进入 Discord 或 OAuth 自动完成
-                # 弹窗可能秒开秒关: 结合 context.pages 实时扫描 + click 前注册的 popup_pages 兜底
+                # ⚠️ 该站点有广告弹窗劫持第一次点击 (get.acebrowser.ai 广告):
+                #    出现广告/无关弹窗 → 关掉 → 重新点击登录按钮 (最多 3 轮)
                 main_page = page
                 discord_page = None
                 auto_done = False
                 seen_urls = set()
-                for _ in range(25):  # 最多 25 秒
-                    candidates = [page] + popup_pages + list(page.context.pages)
-                    checked = []
-                    for np in candidates:
-                        if not any(np is c for c in checked):
-                            checked.append(np)
-                    for p in checked:
-                        u = _safe_url(p)
-                        if not u:
-                            continue
-                        seen_urls.add(u)
-                        if u.startswith("https://discord.com/") or u.startswith("https://discordapp.com/"):
-                            discord_page = p
+                ads_closed = 0
+                for click_round in range(3):
+                    if click_round > 0:
+                        try:
+                            lb = find_login_button(page)
+                            if lb:
+                                lb.click()
+                                log_info(f"第 {click_round + 1} 次点击登录按钮 (累计关闭广告弹窗 {ads_closed} 个)")
+                        except Exception as e:
+                            log_warn(f"重新点击登录按钮失败: {e}")
+                    ads_this_round = 0
+                    for _ in range(15):  # 每轮最多等 15 秒
+                        candidates = [page] + popup_pages + list(page.context.pages)
+                        checked = []
+                        for np in candidates:
+                            if not any(np is c for c in checked):
+                                checked.append(np)
+                        junk = []
+                        for p in checked:
+                            u = _safe_url(p)
+                            if not u:
+                                continue
+                            seen_urls.add(u)
+                            if u.startswith("https://discord.com/") or u.startswith("https://discordapp.com/"):
+                                discord_page = p
+                                break
+                            if p is not main_page and u.startswith("https://free.freezehost.pro/") and (
+                                "/submitlogin" in u or "/callback" in u or "/dashboard" in u
+                            ):
+                                auto_done = True
+                                discord_page = p
+                                break
+                            if p is not main_page and not u.startswith("https://free.freezehost.pro/"):
+                                junk.append(p)
+                        if discord_page or auto_done:
                             break
-                        if p is not main_page and u.startswith("https://free.freezehost.pro/") and (
-                            "/submitlogin" in u or "/callback" in u or "/dashboard" in u
-                        ):
+                        # 关闭广告/无关弹窗
+                        for jp in junk:
+                            try:
+                                jp.close()
+                                ads_closed += 1
+                                ads_this_round += 1
+                                log_info(f"已关闭广告/无关弹窗: {_safe_url(jp)[:80]}")
+                            except Exception:
+                                pass
+                        # 主页面直接变成 dashboard (站点刷新 opener 的情况)
+                        if "/dashboard" in _safe_url(main_page):
                             auto_done = True
-                            discord_page = p
+                            discord_page = main_page
                             break
+                        page.wait_for_timeout(1000)
                     if discord_page or auto_done:
                         break
-                    # 主页面直接变成 dashboard (站点刷新 opener 的情况)
-                    if "/dashboard" in _safe_url(main_page):
-                        auto_done = True
-                        discord_page = main_page
-                        break
-                    page.wait_for_timeout(1000)
+                    if ads_this_round == 0:
+                        break  # 这轮既没等到 Discord 也没有新广告 → 走失败诊断
                 page.context.remove_listener("page", _on_popup)
 
                 if discord_page is None and not auto_done:
                     # 诊断信息: 所有页面 URL / 出现过的 URL / 是否有 Turnstile 人机验证
-                    diag_lines = [f"打开的页面数: {len(page.context.pages)}"]
+                    diag_lines = [f"打开的页面数: {len(page.context.pages)}, 已关闭广告弹窗: {ads_closed}"]
                     for p in page.context.pages:
-                        diag_lines.append(f"  - {_safe_url(p) or '(无法获取 URL)'}")
+                        diag_lines.append(f"  - {_safe_url(p)[:100] or '(无法获取 URL)'}")
                     if seen_urls:
-                        diag_lines.append(f"  出现过的 URL: {sorted(seen_urls)[:6]}")
+                        short = [u[:100] for u in sorted(seen_urls)[:6]]
+                        diag_lines.append(f"  出现过的 URL: {short}")
                     try:
                         if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
                             diag_lines.append("  ⚠️ 检测到 Cloudflare Turnstile 人机验证, Actions 无法自动过盾")
                     except Exception:
                         pass
-                    _diag = "\n".join(diag_lines)
+                    _diag = "\n".join(diag_lines)[:1500]
                     log_error(_diag)
                     buf = take_screenshot(page, "not-discord")
                     current_url = _safe_url(page)
