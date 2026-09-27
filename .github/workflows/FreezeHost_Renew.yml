@@ -1,17 +1,19 @@
 name: FreezeHost 续期
 
-# workflows: write 只能定义在顶层 (job 级会导致整个 workflow 解析失败, 触发器退化成 push)
+# 注意: GITHUB_TOKEN 的 permissions 键不支持 workflows 作用域, 无法修改 workflow 文件。
+# 因此 cron 固定为每天一次, 由 renew.py 自行判断: 剩余 <=7 天才执行续期(重置为14天),
+# >7 天为冷却期直接跳过, 不会重复扣币。每次运行追加记录到 state/renew_history.txt
+# 保持仓库活跃(避开 GitHub 60 天无提交导致定时 workflow 被停用)。
 permissions:
   contents: write
-  workflows: write
 
 on:
   schedule:
-    - cron: '44 1 3 5 *'   # FREEZEHOST_DISCORD_TOKEN_1 - (初始，运行后自动更新)
-    - cron: '37 2 21 4 *'   # FREEZEHOST_DISCORD_TOKEN_2 - (初始，运行后自动更新)
-    - cron: '15 3 10 5 *'   # FREEZEHOST_DISCORD_TOKEN_3 - (初始，运行后自动更新)
-    - cron: '20 4 15 5 *'   # FREEZEHOST_DISCORD_TOKEN_4 - (初始，运行后自动更新)
-    - cron: '25 5 20 5 *'   # FREEZEHOST_DISCORD_TOKEN_5 - (初始，运行后自动更新)
+    - cron: '44 1 * * *'   # FREEZEHOST_DISCORD_TOKEN_1 - 每天固定
+    - cron: '37 2 * * *'   # FREEZEHOST_DISCORD_TOKEN_2 - 每天固定
+    - cron: '15 3 * * *'   # FREEZEHOST_DISCORD_TOKEN_3 - 每天固定
+    - cron: '20 4 * * *'   # FREEZEHOST_DISCORD_TOKEN_4 - 每天固定
+    - cron: '25 5 * * *'   # FREEZEHOST_DISCORD_TOKEN_5 - 每天固定
   workflow_dispatch:
     inputs:
       token_number:
@@ -93,7 +95,7 @@ jobs:
           sudo systemctl disable systemd-resolved 2>/dev/null || true
 
           sudo rm -f /etc/resolv.conf
-          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
+          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" | sudo tee /etc/resolv.conf
 
           sudo chattr +i /etc/resolv.conf 2>/dev/null || true
           sleep 2
@@ -142,185 +144,35 @@ jobs:
           # 否则 FreezeHost 会检测到 headless 模式并永久封禁 IP+账号
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py 2>&1 | tee renew.log
 
-      - name: 提取剩余天数（取所有服务器的最小值）
-        id: extract_days
-        if: success()
+      - name: 记录运行状态 (审计 + 保持仓库活跃)
+        if: always()
         run: |
           set -e
-          
-          MIN_DAYS=""
-          
-          # 优先从 renew_result.json 读取（若存在）
-          if [ -f "renew_result.json" ]; then
-            MIN_DAYS=$(jq -r '.min_remaining_days // empty' renew_result.json)
-            if [ -n "$MIN_DAYS" ]; then
-              echo "✅ 从 renew_result.json 读取最小剩余天数: $MIN_DAYS"
-            fi
-          fi
-          
-          # 其次从 renew.log 提取所有剩余天数，取最小值
-          if [ -z "$MIN_DAYS" ] && [ -f "renew.log" ]; then
-            echo "📋 从 renew.log 提取所有服务器剩余天数："
-            
-            MIN_DAYS=""
-            while IFS= read -r line; do
-              DAYS=$(echo "$line" | grep -oiP '\d+(?=\s*DAYS?)' | head -1 || echo "0")
-              HOURS=$(echo "$line" | grep -oiP '\d+\.?\d*(?=\s*HOURS?)' | head -1 || echo "0")
-              
-              if [ "$DAYS" != "0" ] || [ "$HOURS" != "0" ]; then
-                TOTAL=$(echo "scale=6; $DAYS + ($HOURS / 24)" | bc)
-                echo "  - $DAYS 天 + $HOURS 小时 = $TOTAL 天"
-                
-                if [ -z "$MIN_DAYS" ] || (( $(echo "$TOTAL < $MIN_DAYS" | bc -l) )); then
-                  MIN_DAYS="$TOTAL"
-                fi
-              fi
-            done < <(grep -iE "续期状态: .* DAYS? AND .* HOURS? REMAINING" renew.log || true)
-            
-            if [ -n "$MIN_DAYS" ]; then
-              echo "✅ 最小剩余天数: $MIN_DAYS"
-            fi
-          fi
-          
-          # 如果都没找到（续期失败/站点故障），改为明天重试而不是保持过期 Cron
-          if [ -z "$MIN_DAYS" ] || [ "$MIN_DAYS" = "0" ]; then
-            echo "::warning::未找到有效的剩余时间（续期可能失败），明天重试"
-            echo "remaining_days=-1" >> "$GITHUB_OUTPUT"
-            echo "skip_update=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          
-          echo "remaining_days=$MIN_DAYS" >> "$GITHUB_OUTPUT"
-          echo "skip_update=false" >> "$GITHUB_OUTPUT"
-          echo "::notice::剩余天数（最小值）: $MIN_DAYS"
-          
-          mkdir -p /tmp/renew_data
-          echo "$MIN_DAYS" > /tmp/renew_data/remaining_days.txt
-
-      - name: 拉取仓库
-        if: success() && steps.extract_days.outputs.skip_update != 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository }}
-          token: ${{ github.token }}
-          path: workflow_repo
-          fetch-depth: 1
-
-      - name: 修改 Cron 时间
-        if: success() && steps.extract_days.outputs.skip_update != 'true'
-        run: |
-          set -e
-
-          # 读取剩余天数（优先 output，其次临时文件）
-          REMAINING_DAYS="${{ steps.extract_days.outputs.remaining_days }}"
-          
-          if [ -z "$REMAINING_DAYS" ] && [ -f "/tmp/renew_data/remaining_days.txt" ]; then
-            REMAINING_DAYS=$(cat /tmp/renew_data/remaining_days.txt)
-          fi
-          
           TOKEN_NUM="${{ steps.select_token.outputs.token_number }}"
 
-          echo "剩余天数: $REMAINING_DAYS"
-          echo "Token 编号: $TOKEN_NUM"
-
-          # 计算下次运行时间（到期前 2 天）
-          if [ "$REMAINING_DAYS" = "-1" ]; then
-            DAYS_UNTIL_NEXT_RUN=1
-            echo "::warning::本次续期未成功，明天重试"
-          elif (( $(echo "$REMAINING_DAYS > 2" | bc -l) )); then
-            DAYS_UNTIL_NEXT_RUN=$(echo "$REMAINING_DAYS - 2" | bc)
-          else
-            DAYS_UNTIL_NEXT_RUN=1
-            echo "::warning::剩余时间不足 2 天，明天再次续期"
+          REMAINING="?"
+          if [ -f "renew.log" ]; then
+            REMAINING=$(grep -iE "续期状态: .* DAYS? AND .* HOURS? REMAINING" renew.log \
+              | head -1 | grep -oiP '\d+(?=\s*DAYS?)' || echo "?")
           fi
+          [ -z "$REMAINING" ] && REMAINING="?"
 
-          DAYS_INT=$(printf "%.0f" "$DAYS_UNTIL_NEXT_RUN")
-          NEXT_DATE=$(date -u -d "+${DAYS_INT} days" +"%Y-%m-%d %H:%M")
-          NEXT_DAY=$(date -u -d "+${DAYS_INT} days" +"%-d")
-          NEXT_MONTH=$(date -u -d "+${DAYS_INT} days" +"%-m")
-          
-          # 根据 Token 编号设置不同的小时（保持 01~05 UTC，避免冲突）
-          case "$TOKEN_NUM" in
-            1) NEXT_HOUR=1 ;;
-            2) NEXT_HOUR=2 ;;
-            3) NEXT_HOUR=3 ;;
-            4) NEXT_HOUR=4 ;;
-            5) NEXT_HOUR=5 ;;
-            *) NEXT_HOUR=$(date -u +"%H") ;;
-          esac
-          
-          NEXT_MINUTE=$(date -u +"%M")
-
-          NEW_CRON="$NEXT_MINUTE $NEXT_HOUR $NEXT_DAY $NEXT_MONTH *"
-
-          echo "::notice::📅 下次运行: $NEXT_DATE UTC"
-          echo "::notice::⏰ 新 Cron: $NEW_CRON"
-
-          # 切换到 workflow_repo 目录
-          cd workflow_repo
-
-          # 从 github.workflow_ref 提取当前 workflow 文件路径
-          WORKFLOW_FILE=$(echo "${{ github.workflow_ref }}" | sed -E 's|^[^/]+/[^/]+/(\.github/workflows/[^@]+)@.*|\1|')
-
-          echo "::notice::📄 当前 workflow 文件: $WORKFLOW_FILE"
-
-          if [ ! -f "$WORKFLOW_FILE" ]; then
-            echo "::error::文件不存在: $WORKFLOW_FILE"
-            echo "::group::.github/workflows 目录内容"
-            ls -la .github/workflows/
-            echo "::endgroup::"
-            exit 1
-          fi
-
-          # 查找对应 Token 的 cron 行
-          TARGET_PATTERN="FREEZEHOST_DISCORD_TOKEN_$TOKEN_NUM"
-          LINE_NUM=$(grep -n "$TARGET_PATTERN" "$WORKFLOW_FILE" | cut -d: -f1 | head -n1)
-
-          if [ -z "$LINE_NUM" ]; then
-            echo "::error::找不到 $TARGET_PATTERN 对应行"
-            echo "::group::文件内容"
-            nl -ba "$WORKFLOW_FILE"
-            echo "::endgroup::"
-            exit 1
-          fi
-
-          echo "::notice::更新第 $LINE_NUM 行"
-
-          echo "::group::原始行"
-          sed -n "${LINE_NUM}p" "$WORKFLOW_FILE"
-          echo "::endgroup::"
-
-          # 替换指定行
-          sed -i "${LINE_NUM}c\\    - cron: '$NEW_CRON'   # FREEZEHOST_DISCORD_TOKEN_$TOKEN_NUM - 下一次: $NEXT_DATE UTC" "$WORKFLOW_FILE"
-
-          echo "::group::修改后"
-          sed -n "${LINE_NUM}p" "$WORKFLOW_FILE"
-          echo "::endgroup::"
-
-          # 检查是否有变化
-          if git diff --quiet "$WORKFLOW_FILE"; then
-            echo "::notice::没有变化需要提交"
-            exit 0
-          fi
-
-          echo "::group::完整修改内容"
-          git diff "$WORKFLOW_FILE"
-          echo "::endgroup::"
-
-          # 提交并推送
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$WORKFLOW_FILE"
-          
-          git commit -m "自动调整 FREEZEHOST_DISCORD_TOKEN_$TOKEN_NUM 下次续期时间" \
-                     -m "下次运行: $NEXT_DATE UTC" \
-                     -m "Cron: $NEW_CRON" \
-                     -m "剩余天数（最小值）: $REMAINING_DAYS"
-          
-          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          git push
 
-          echo "::notice::✅ 成功更新 workflow 文件"
+          mkdir -p state
+          LINE="$(date -u '+%Y-%m-%d %H:%M') | token=$TOKEN_NUM | remaining=${REMAINING}d | job=${{ job.status }}"
+          echo "$LINE" >> state/renew_history.txt
+          tail -n 300 state/renew_history.txt > state/.tmp && mv state/.tmp state/renew_history.txt
+
+          git add state/renew_history.txt
+          if git diff --cached --quiet; then
+            echo "状态无变化, 跳过提交"
+            exit 0
+          fi
+          git commit -q -m "record: token $TOKEN_NUM 运行记录" -m "$LINE"
+          git pull --rebase -q origin main || true
+          git push origin main 2>&1 | tail -1 || echo "::warning::状态推送失败 (下次运行会重试)"
 
       - name: 上传截图和HTML（排查用）
         if: always()

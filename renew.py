@@ -1722,7 +1722,8 @@ def run():
             server_ids = discover_server_ids(page)
             if not server_ids:
                 buf = take_screenshot(page, "no-servers")
-                send_tg(f"用户：{display_name}\n⚠️ 未发现服务器\n\nFreezeHost Auto Renew", buf)
+                # 固定每日运行后, 无服务器是常态 (其他 token 账号), 只记日志不推 TG 防刷屏
+                log_warn(f"未发现服务器, 当前 URL: {page.url} (已截图存档)")
                 return
 
             # dashboard 页面上提取每台服务器的续期链接 (剩余 <=7 天时才生成)
@@ -1748,6 +1749,12 @@ def run():
                          else None)
 
             # ── TG 推送（带 emoji 格式） ──────
+            # 固定每日运行后: 纯冷却期不再推送 (免得每天刷屏), 只推送有动作/异常的结果
+            actionable = [r for r in results if r.get("status") in ("renewed", "error", "broke")]
+            if not actionable:
+                summary = "; ".join(f"{r['server_id']}:{r['status']}({r.get('detail', '')})" for r in results)
+                log_info(f"全部服务器处于冷却期, 跳过 TG 推送: {summary}")
+                return
             now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
             lines = [f"🎮FreezeHost 续期通知", f"⏰运行时间: {now_str}", f"🖥️账号: {display_name}"]
             for r in results:
