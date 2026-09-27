@@ -671,6 +671,16 @@ def process_server(page, server_id: str) -> dict:
             const el = document.getElementById('renewal-status-console');
             return el ? el.innerText.trim() : null;
         }""")
+        if not status_text:
+            # 状态元素为空时回退: 从整页文本抓取剩余时间 (如 "9 days and 7 hours Remaining")
+            status_text = page.evaluate(r"""() => {
+                const t = (document.body.innerText || '');
+                const m = t.match(/\d+\s*days?\s+and\s+\d+\s*hours?\s+(?:Remaining|Left)/i)
+                        || t.match(/Active\s*\([^)]*Left\)/i);
+                return m ? m[0] : null;
+            }""")
+            if status_text:
+                log_info(f"[{server_id}] 状态元素为空, 从页面文本解析: {status_text}")
         log_info(f"[{server_id}] 续期状态: {status_text or '(空)'}")
 
         remaining_before = parse_remaining(status_text)

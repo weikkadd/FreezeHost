@@ -159,8 +159,8 @@ jobs:
             
             MIN_DAYS=""
             while IFS= read -r line; do
-              DAYS=$(echo "$line" | grep -oP '\d+(?=\s*DAYS?)' || echo "0")
-              HOURS=$(echo "$line" | grep -oP '\d+\.?\d*(?=\s*HOURS?)' || echo "0")
+              DAYS=$(echo "$line" | grep -oiP '\d+(?=\s*DAYS?)' | head -1 || echo "0")
+              HOURS=$(echo "$line" | grep -oiP '\d+\.?\d*(?=\s*HOURS?)' | head -1 || echo "0")
               
               if [ "$DAYS" != "0" ] || [ "$HOURS" != "0" ]; then
                 TOTAL=$(echo "scale=6; $DAYS + ($HOURS / 24)" | bc)
@@ -170,7 +170,7 @@ jobs:
                   MIN_DAYS="$TOTAL"
                 fi
               fi
-            done < <(grep -E "续期状态: .* DAYS? AND .* HOURS? REMAINING" renew.log || true)
+            done < <(grep -iE "续期状态: .* DAYS? AND .* HOURS? REMAINING" renew.log || true)
             
             if [ -n "$MIN_DAYS" ]; then
               echo "✅ 最小剩余天数: $MIN_DAYS"
