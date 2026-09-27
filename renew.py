@@ -945,7 +945,30 @@ def run():
         """)
         page = context.new_page()
         page.set_default_timeout(TIMEOUT)
-        log_info("浏览器就绪 (已预加载 Discord Token + 反检测脚本)")
+
+        # 网络层拦截广告域名: FreezeHost 的 Google 锚定广告 (aswift) 会盖住登录按钮并劫持点击弹广告
+        _AD_HOSTS = ("googleads.g.doubleclick.net", "pagead2.googlesyndication.com",
+                     "tpc.googlesyndication.com", "googlesyndication.com", "doubleclick.net",
+                     "get.acebrowser.ai", "google-analytics.com", "analytics.google.com")
+
+        def _route_ads(route):
+            try:
+                if any(h in route.request.url for h in _AD_HOSTS):
+                    route.abort()
+                    return
+            except Exception:
+                pass
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+        try:
+            context.route("**/*", _route_ads)
+        except Exception as e:
+            log_warn(f"广告拦截注册失败: {e}")
+
+        log_info("浏览器就绪 (已预加载 Discord Token + 反检测脚本, 广告域名已拦截)")
 
         # 诊断: 打印实际 UA 和 webdriver 状态, 确认反检测生效
         try:
@@ -1025,13 +1048,25 @@ def run():
                     )
                     raise RuntimeError("找不到登录按钮, FreezeHost 可能改版")
 
+                # 清除广告元素 (Google 锚定广告会盖住登录按钮并劫持点击)
+                try:
+                    _kill_ads = '''() => { document.querySelectorAll('ins.adsbygoogle, iframe[id^="aswift_"], iframe[title="Advertisement"]').forEach(e => e.remove()); }'''
+                    page.evaluate(_kill_ads)
+                except Exception:
+                    pass
+
                 # 预先注册弹窗监听 (必须在 click 之前, 才能捕获秒开秒关的 OAuth 弹窗)
                 popup_pages = []
                 def _on_popup(p):
                     popup_pages.append(p)
                 page.context.on("page", _on_popup)
 
-                btn.click()
+                try:
+                    btn.click(timeout=8000)
+                except Exception:
+                    # 被广告/遮罩层挡住时, 直接向按钮派发点击事件 (绕过遮挡)
+                    log_warn("常规点击被遮挡, 改用 dispatch_event 直接触发按钮点击")
+                    btn.dispatch_event("click")
                 log_info("已点击登录按钮")
 
                 # 等待可能出现的「服务条款确认」对话框
