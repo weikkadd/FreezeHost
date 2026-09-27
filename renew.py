@@ -779,6 +779,24 @@ def try_dashboard_renew_modal(page, server_id: str):
         except Exception:
             pass
 
+        # 监听模态框数据加载相关的网络请求, 定位它依赖的 API (run55: 卡在 Checking 24 秒无响应)
+        net_events = []
+        def _on_net(obj):
+            try:
+                u = obj.url or ""
+                if "freezehost" in u and any(k in u for k in ("/api/", "renew", "renewal", "server")):
+                    kind = "resp" if hasattr(obj, "status") else "req"
+                    line = f"{kind}:{getattr(obj, 'status', '?')} {u[:110]}"
+                    if line not in net_events:
+                        net_events.append(line)
+            except Exception:
+                pass
+        try:
+            page.on("response", _on_net)
+            page.on("request", _on_net)
+        except Exception:
+            pass
+
         btn = page.locator('button:has-text("Renew Instance"), a:has-text("Renew Instance")').first
         if btn.count() == 0:
             log_info(f"[{server_id}] dashboard 无 Renew Instance 按钮 (可能仍处冷却期)")
@@ -819,6 +837,30 @@ def try_dashboard_renew_modal(page, server_id: str):
             if renewable_text and not re.search(r"checking|loading", renewable_text, re.I):
                 break
         log_info(f"[{server_id}] #renewal-renewable-modal 异步加载结果: {renewable_text[:200]}")
+
+        if re.search(r"checking|loading", renewable_text, re.I):
+            # 数据加载卡死: dump 续期内联 JS + 网络请求记录, 定位异步 API
+            try:
+                page.remove_listener("response", _on_net)
+                page.remove_listener("request", _on_net)
+            except Exception:
+                pass
+            log_warn(f"[{server_id}] 模态框数据加载卡在 Checking, 相关网络请求: {net_events[:14] or '(无任何请求发出!)'}")
+            try:
+                js_dump = page.evaluate(r"""() => {
+                    const out = [];
+                    document.querySelectorAll('script:not([src])').forEach(s => {
+                        const t = s.textContent || '';
+                        if (/renew/i.test(t)) out.push(t.replace(/\s+/g, ' '));
+                    });
+                    out.sort((a, b) => b.length - a.length);
+                    return out.slice(0, 2).map(t => t.slice(0, 2800));
+                }""") or []
+                for i, s in enumerate(js_dump):
+                    log_info(f"[{server_id}] 续期内联脚本 {i}: {s}")
+            except Exception as e:
+                log_warn(f"[{server_id}] 内联脚本 dump 失败: {e}")
+            return False, None, "模态框数据加载卡在 Checking (异步接口未完成)"
 
         # 异步内容渲染后重新扫描 /renew?id= 链接
         try:
@@ -1112,7 +1154,7 @@ def process_server(page, server_id: str, renew_links: dict | None = None, dashbo
             log_warn(f"[{server_id}] 页面元素 ID: {_diag.get('ids', [])[:20]}")
             log_warn(f"[{server_id}] 续期相关元素: {_diag.get('renewEls', [])[:8]}")
             log_warn(f"[{server_id}] 页面文本摘要: {_diag.get('text', '')}")
-            raise RuntimeError("未找到续期链接")
+            raise RuntimeError(f"未找到续期链接{(':' + note) if note else ''}")
 
         btn_text = renew_href.get("text", "")
         href = renew_href["href"]
