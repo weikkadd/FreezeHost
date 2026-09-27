@@ -235,15 +235,17 @@ def check_site_down(page) -> bool:
         if "500 internal server error" in html_lower:
             return True
 
-        # Cloudflare 错误页
-        if "cloudflare" in html_lower and "error" in html_lower:
+        # Cloudflare 拦截/错误页 (必须具体特征; 正常页面引用 cdnjs.cloudflare.com 或 JS 里含 error 会误报, 不能用松散组合)
+        if "sorry, you have been blocked" in html_lower or "error 1020" in html_lower or "attention required" in html_lower:
             return True
-        if "cf-ray" in html_lower and ("error" in html_lower or "sorry" in html_lower):
+        if "just a moment" in html_lower or "checking your browser" in html_lower:
+            return True
+        import re as _re
+        if _re.search(r'\berror\s*(?:1\d{3}|5\d{2})\b', html):
             return True
 
         # 标题检测
         if "<title>" in html_lower:
-            import re as _re
             title_match = _re.search(r'<title[^>]*>([^<]+)</title>', html, _re.IGNORECASE)
             if title_match:
                 title = title_match.group(1).lower()
@@ -251,7 +253,9 @@ def check_site_down(page) -> bool:
                     return True
                 if "502" in title or "503" in title or "504" in title:
                     return True
-                if "error" in title and "freezehost" not in title:
+                if ("cloudflare" in title or "error" in title) and "freezehost" not in title:
+                    return True
+                if "just a moment" in title or "attention required" in title:
                     return True
 
         return False
@@ -331,15 +335,14 @@ def diagnose_site_down(page) -> str:
             return "Cloudflare WAF 拦截页 (出口 IP 被 FreezeHost 拉黑, 需更换 PROXY_URL 节点)"
         if "just a moment" in html_lower or "checking your browser" in html_lower or "challenge-platform" in html_lower:
             return "Cloudflare 人机验证页 (当前出口被风控, 需更换 PROXY_URL 节点)"
-        if "cloudflare" in html_lower and "error" in html_lower:
-            import re as _re2
-            _code = _re2.search(r'[Ee]rror\s*(?:1\d{3}|5\d{2})', html)
+        # Cloudflare 标准错误页 (需具体错误码如 "Error 521"; 正常页面引用 cdnjs.cloudflare.com 会误报, 不能用松散组合)
+        import re as _re2
+        _code = _re2.search(r'\berror\s*(?:1\d{3}|5\d{2})\b', html)
+        if _code and "cloudflare" in html_lower:
             _title_m = _re2.search(r'<title[^>]*>([^<]+)</title>', html, _re2.IGNORECASE)
-            _detail = _code.group(0) if _code else "CDN 层故障"
-            if _title_m:
-                return f"Cloudflare 错误页 [{_detail}] 标题: {_title_m.group(1).strip()}"
-            return f"Cloudflare 错误页 [{_detail}]"
-        if "cf-ray" in html_lower and ("error" in html_lower or "sorry" in html_lower):
+            _title = _title_m.group(1).strip() if _title_m else ""
+            return f"Cloudflare 错误页 [{_code.group(0)}] 标题: {_title}" if _title else f"Cloudflare 错误页 [{_code.group(0)}]"
+        if "cf-ray" in html_lower and ("sorry" in html_lower):
             return "Cloudflare 拦截页 (可能被风控)"
 
         # 标题检测
