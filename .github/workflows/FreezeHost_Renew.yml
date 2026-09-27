@@ -1,7 +1,9 @@
 name: FreezeHost 续期
 
+# workflows: write 只能定义在顶层 (job 级会导致整个 workflow 解析失败, 触发器退化成 push)
 permissions:
   contents: write
+  workflows: write
 
 on:
   schedule:
@@ -32,7 +34,6 @@ jobs:
     permissions:
       contents: write
       actions: write
-      workflows: write
 
     steps:
       - name: 确定使用哪个 Token
