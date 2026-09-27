@@ -853,14 +853,48 @@ def try_dashboard_renew_modal(page, server_id: str):
                         const t = s.textContent || '';
                         if (/renew/i.test(t)) out.push(t.replace(/\s+/g, ' '));
                     });
-                    out.sort((a, b) => b.length - a.length);
-                    return out.slice(0, 2).map(t => t.slice(0, 2800));
+                    out.sort((a, b) => ((b.includes('openRenewalModal') ? 1 : 0) - (a.includes('openRenewalModal') ? 1 : 0)) || (b.length - a.length));
+                    return out.slice(0, 1).map(t => t.slice(0, 6000));
                 }""") or []
                 for i, s in enumerate(js_dump):
-                    log_info(f"[{server_id}] 续期内联脚本 {i}: {s}")
+                    log_info(f"[{server_id}] renewal 内联脚本 {i}: {s}")
             except Exception as e:
                 log_warn(f"[{server_id}] 内联脚本 dump 失败: {e}")
-            return False, None, "模态框数据加载卡在 Checking (异步接口未完成)"
+
+            # 站点自己的 fetch 没发出来 → 绕过 UI, 直接调 /api/renewalstatus 拿续期状态
+            try:
+                probe = page.evaluate(r"""async (sid) => {
+                    try {
+                        const r = await fetch(`/api/renewalstatus?id=${encodeURIComponent(sid)}`, {headers: {'Accept': 'application/json'}});
+                        const st = r.status;
+                        let body = '';
+                        try { body = await r.text(); } catch(e) {}
+                        return {status: st, body: body.slice(0, 900)};
+                    } catch (e) {
+                        return {status: 0, body: 'fetch error: ' + (e && e.message || e)};
+                    }
+                }""", server_id) or {}
+                log_info(f"[{server_id}] /api/renewalstatus 直接探测: HTTP {probe.get('status')} body={str(probe.get('body'))[:400]}")
+                if probe.get("status") == 200:
+                    body = probe.get("body") or ""
+                    try:
+                        data = json.loads(body)
+                    except Exception:
+                        data = {}
+                    if isinstance(data, dict):
+                        for k in ("renewUrl", "renew_url", "url", "href", "link"):
+                            v = data.get(k)
+                            if isinstance(v, str) and "renew" in v.lower():
+                                return False, {"href": urljoin(BASE_URL + "/", v), "text": "Renew Instance"}, "api-link"
+                        if data.get("isPaid") or data.get("isAdmin"):
+                            log_info(f"[{server_id}] 站点标记 isPaid/isAdmin, 无需续期")
+                            return False, None, f"API 返回 isPaid/isAdmin=真 ({body[:80]})"
+                    # 可续期 → 直接走老入口 /renew?id=<id> (goto 后由 success=RENEWED / err= 判断)
+                    return False, {"href": f"/renew?id={server_id}", "text": "Renew Instance"}, "api-renewable"
+                return False, None, f"/api/renewalstatus HTTP {probe.get('status')}, 疑似接口拒绝当前出口"
+            except Exception as e:
+                log_warn(f"[{server_id}] renewalstatus 探测异常: {e}")
+                return False, None, "模态框数据加载卡在 Checking 且直接探测失败"
 
         # 异步内容渲染后重新扫描 /renew?id= 链接
         try:
