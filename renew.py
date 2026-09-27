@@ -656,7 +656,39 @@ def discover_server_ids(page) -> list[str]:
 
     return []
 
-def process_server(page, server_id: str) -> dict:
+def collect_renew_links(page) -> dict:
+    """从 dashboard 页面 HTML 提取每台服务器的续期链接 /renew?id=<hex> (控制台页内没有续期入口)"""
+    try:
+        pairs = page.evaluate(r"""() => {
+            const out = [];
+            const seen = new Set();
+            document.querySelectorAll('a[href*="renew?id="]').forEach(a => {
+                const h = a.getAttribute('href');
+                const m = (h || '').match(/id=([a-f0-9]{6,})/i);
+                if (m && !seen.has(h)) { seen.add(h); out.push({ id: m[1], href: h }); }
+            });
+            if (!out.length) {
+                for (const m of document.body.innerHTML.matchAll(/href=["']((?:\.\.)?\/renew\?id=([a-f0-9]{6,}))["']/gi))
+                    out.push({ id: m[2], href: m[1] });
+            }
+            return out;
+        }""") or []
+        result = {}
+        for it in pairs:
+            sid = (it.get("id") or "").lower()
+            href = it.get("href") or ""
+            if sid and href:
+                result[sid] = urljoin(BASE_URL + "/", href)
+        if result:
+            log_info(f"从 dashboard 提取到 {len(result)} 个续期链接: {[(k, v[:40]) for k, v in result.items()]}")
+        else:
+            log_warn("dashboard 页面未提取到 /renew?id= 续期链接 (剩余 >7 天时站点可能不生成)")
+        return result
+    except Exception as e:
+        log_warn(f"提取续期链接失败: {e}")
+        return {}
+
+def process_server(page, server_id: str, renew_links: dict | None = None) -> dict:
     tag = _server_label(server_id)
     server_url = f"{BASE_URL}/server-console?id={server_id}"
     result = dict(server_id=server_id, status="unknown", before=None, after=None,
@@ -712,15 +744,23 @@ def process_server(page, server_id: str) -> dict:
             return result
 
         # ── 查找续期链接 ─────────────────────────────────
-        renew_href = page.evaluate("""() => {
-            const rl = document.getElementById('renew-link-modal');
-            if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
-            for (const a of document.querySelectorAll('a[href*="renew"]')) {
-                const h = a.getAttribute('href');
-                if (h && h.includes('renew') && h !== '#') return {href:h, text:a.innerText.trim()};
-            }
-            return null;
-        }""")
+        # 优先用 dashboard 页面提取的 /renew?id= 链接 (控制台页内没有续期入口)
+        renew_href = None
+        pre = (renew_links or {}).get(server_id.lower())
+        if pre:
+            log_info(f"[{server_id}] 使用 dashboard 提取的续期链接")
+            renew_href = {"href": pre, "text": "dashboard-extract"}
+
+        if not (renew_href and renew_href.get("href")):
+            renew_href = page.evaluate("""() => {
+                const rl = document.getElementById('renew-link-modal');
+                if (rl) { const h = rl.getAttribute('href'); if (h && h !== '#') return {href:h, text:rl.innerText.trim()}; }
+                for (const a of document.querySelectorAll('a[href*="renew"]')) {
+                    const h = a.getAttribute('href');
+                    if (h && h.includes('renew') && h !== '#') return {href:h, text:a.innerText.trim()};
+                }
+                return null;
+            }""")
 
         if not (renew_href and renew_href.get("href")):
             # 尝试点击外链图标
@@ -1432,11 +1472,14 @@ def run():
                 send_tg(f"用户：{display_name}\n⚠️ 未发现服务器\n\nFreezeHost Auto Renew", buf)
                 return
 
+            # dashboard 页面上提取每台服务器的续期链接 (剩余 <=7 天时才生成)
+            renew_links = collect_renew_links(page)
+
             # ── 逐台处理 ─────────────────────────────────
             results, screenshots = [], []
             for sid in server_ids:
                 log_info("=" * 50)
-                res = process_server(page, sid)
+                res = process_server(page, sid, renew_links)
                 results.append(res)
                 buf = take_screenshot(page, f"server-{_SERVER_INDEX.get(sid, 0)}")
                 if buf:
