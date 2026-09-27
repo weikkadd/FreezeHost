@@ -683,6 +683,18 @@ def collect_renew_links(page) -> dict:
             log_info(f"从 dashboard 提取到 {len(result)} 个续期链接: {[(k, v[:40]) for k, v in result.items()]}")
         else:
             log_warn("dashboard 页面未提取到 /renew?id= 续期链接 (剩余 >7 天时站点可能不生成)")
+            try:
+                btns = page.evaluate(r"""() => {
+                    const out = [];
+                    document.querySelectorAll('button, a, [role=button]').forEach(e => {
+                        const t = (e.innerText || '').trim().replace(/\s+/g, ' ');
+                        if (t && t.length < 40) out.push(t);
+                    });
+                    return [...new Set(out)].slice(0, 25);
+                }""")
+                log_info(f"dashboard 可点击元素: {btns}")
+            except Exception:
+                pass
         return result
     except Exception as e:
         log_warn(f"提取续期链接失败: {e}")
