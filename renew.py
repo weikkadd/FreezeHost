@@ -667,6 +667,24 @@ def process_server(page, server_id: str) -> dict:
         safe_goto(page, server_url, timeout=30000)
         page.wait_for_timeout(3000)
 
+        # FreezeHost 检测到广告拦截器时会把控制台锁在 "Ad Blocker Detected" 页后面:
+        # 点击 "I'VE DISABLED MY ADBLOCKER / RECHECK" 重新验证解锁
+        try:
+            gate_btn = page.locator('button:has-text("recheck"), button:has-text("disabled my adblocker")')
+            if gate_btn.count() > 0 and gate_btn.first.is_visible(timeout=2000):
+                log_warn(f"[{server_id}] 检测到 Ad Blocker 拦截页, 点击重新验证解锁")
+                gate_btn.first.click(timeout=5000)
+                page.wait_for_timeout(6000)
+                # 若仍被拦截, 再点一次
+                try:
+                    if gate_btn.first.is_visible(timeout=2000):
+                        gate_btn.first.click(timeout=5000)
+                        page.wait_for_timeout(6000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         status_text = page.evaluate("""() => {
             const el = document.getElementById('renewal-status-console');
             return el ? el.innerText.trim() : null;
@@ -971,10 +989,10 @@ def run():
         page = context.new_page()
         page.set_default_timeout(TIMEOUT)
 
-        # 网络层拦截广告域名: FreezeHost 的 Google 锚定广告 (aswift) 会盖住登录按钮并劫持点击弹广告
-        _AD_HOSTS = ("googleads.g.doubleclick.net", "pagead2.googlesyndication.com",
-                     "tpc.googlesyndication.com", "googlesyndication.com", "doubleclick.net",
-                     "get.acebrowser.ai", "google-analytics.com", "analytics.google.com")
+        # 网络层只拦截劫持弹窗的 acebrowser.ai;
+        # FreezeHost 依赖自有 AdSense 收入且检测广告拦截器 (拦了会把控制台锁在 Ad Blocker Detected 页后面),
+        # 所以 googlesyndication/doubleclick 必须放行, 锚定广告的点击干扰用 dispatch_event 绕过
+        _AD_HOSTS = ("get.acebrowser.ai",)
 
         def _route_ads(route):
             try:
@@ -993,7 +1011,7 @@ def run():
         except Exception as e:
             log_warn(f"广告拦截注册失败: {e}")
 
-        log_info("浏览器就绪 (已预加载 Discord Token + 反检测脚本, 广告域名已拦截)")
+        log_info("浏览器就绪 (已预加载 Discord Token + 反检测脚本, 已拦截 acebrowser 广告劫持)")
 
         # 诊断: 打印实际 UA 和 webdriver 状态, 确认反检测生效
         try:
@@ -1072,13 +1090,6 @@ def run():
                         buf,
                     )
                     raise RuntimeError("找不到登录按钮, FreezeHost 可能改版")
-
-                # 清除广告元素 (Google 锚定广告会盖住登录按钮并劫持点击)
-                try:
-                    _kill_ads = '''() => { document.querySelectorAll('ins.adsbygoogle, iframe[id^="aswift_"], iframe[title="Advertisement"]').forEach(e => e.remove()); }'''
-                    page.evaluate(_kill_ads)
-                except Exception:
-                    pass
 
                 # 预先注册弹窗监听 (必须在 click 之前, 才能捕获秒开秒关的 OAuth 弹窗)
                 popup_pages = []
