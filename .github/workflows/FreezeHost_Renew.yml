@@ -177,10 +177,11 @@ jobs:
             fi
           fi
           
-          # 如果都没找到，退出
+          # 如果都没找到（续期失败/站点故障），改为明天重试而不是保持过期 Cron
           if [ -z "$MIN_DAYS" ] || [ "$MIN_DAYS" = "0" ]; then
-            echo "::warning::未找到有效的剩余时间，跳过 workflow 更新"
-            echo "skip_update=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::未找到有效的剩余时间（续期可能失败），明天重试"
+            echo "remaining_days=-1" >> "$GITHUB_OUTPUT"
+            echo "skip_update=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           
@@ -218,11 +219,14 @@ jobs:
           echo "Token 编号: $TOKEN_NUM"
 
           # 计算下次运行时间（到期前 2 天）
-          if (( $(echo "$REMAINING_DAYS > 2" | bc -l) )); then
+          if [ "$REMAINING_DAYS" = "-1" ]; then
+            DAYS_UNTIL_NEXT_RUN=1
+            echo "::warning::本次续期未成功，明天重试"
+          elif (( $(echo "$REMAINING_DAYS > 2" | bc -l) )); then
             DAYS_UNTIL_NEXT_RUN=$(echo "$REMAINING_DAYS - 2" | bc)
           else
-            DAYS_UNTIL_NEXT_RUN=0.5
-            echo "::warning::剩余时间不足 2 天，12 小时后重试"
+            DAYS_UNTIL_NEXT_RUN=1
+            echo "::warning::剩余时间不足 2 天，明天再次续期"
           fi
 
           DAYS_INT=$(printf "%.0f" "$DAYS_UNTIL_NEXT_RUN")
