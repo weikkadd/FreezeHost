@@ -700,7 +700,163 @@ def collect_renew_links(page) -> dict:
         log_warn(f"提取续期链接失败: {e}")
         return {}
 
-def process_server(page, server_id: str, renew_links: dict | None = None) -> dict:
+def normalize_left_text(text: str) -> str | None:
+    """把站点新版剩余时间格式 '6d 5h left' 规范成 '6 days and 5 hours Remaining'。
+    规范化后 parse_remaining / remaining_total_days / Workflow 的 renew.log 提取全部继续工作。
+    注意必须要求 left/remaining 后缀, 否则会误匹配控制台的 Uptime '7d 18h 29m'。"""
+    if not text:
+        return None
+    m = re.search(r"(\d+)\s*d\s+(\d+)\s*h\s*(?:left|remaining)", text, re.I)
+    if m:
+        return f"{int(m.group(1))} days and {int(m.group(2))} hours Remaining"
+    return None
+
+
+def collect_dashboard_left(page) -> tuple[dict, list]:
+    """从 dashboard 页面提取每台服务器的剩余时间 (新版显示在服务器卡片上, 如 '6d 5h left';
+    控制台页 /server-console 已不再显示状态文本)。
+    返回 ({sid: 规范化文本}, [未能关联 id 的规范化文本])"""
+    try:
+        pairs = page.evaluate(r"""() => {
+            const out = [];
+            const leftRe = /(\d+)\s*d\s*\d+\s*h\s*left/i;
+            document.querySelectorAll('a[href*="server-console?id="]').forEach(a => {
+                const m = (a.getAttribute('href') || '').match(/id=([a-f0-9]{6,})/i);
+                if (!m) return;
+                let card = a.closest('div');
+                for (let i = 0; i < 8 && card; i++) {
+                    const mm = (card.innerText || '').match(leftRe);
+                    if (mm) { out.push({ id: m[1], text: mm[0] }); return; }
+                    card = card.parentElement;
+                }
+            });
+            if (!out.length) {
+                const gm = (document.body.innerText || '').match(leftRe);
+                if (gm) out.push({ id: '', text: gm[0] });
+            }
+            return out;
+        }""") or []
+        result, fallback = {}, []
+        for it in pairs:
+            norm = normalize_left_text(it.get("text") or "")
+            if not norm:
+                continue
+            sid = (it.get("id") or "").lower()
+            if sid:
+                result[sid] = norm
+            else:
+                fallback.append(norm)
+        if result:
+            log_info(f"从 dashboard 解析剩余时间: {result}")
+        elif fallback:
+            log_info(f"dashboard 检测到剩余时间 (未能关联服务器 id): {fallback}")
+        else:
+            log_warn("dashboard 上未检测到 'Xd Yh left' 剩余时间")
+        return result, fallback
+    except Exception as e:
+        log_warn(f"解析 dashboard 剩余时间失败: {e}")
+        return {}, []
+
+
+def try_dashboard_renew_modal(page, server_id: str):
+    """新版站点把续期入口从 /renew?id= 链接改成 dashboard 的 'Renew Instance' 按钮。
+    点击后: ① 重新扫描 /renew?id= 链接 (模态框打开后才生成) → 交给原有 goto 流程;
+    ② 无链接则找模态框内确认按钮直接点击, 通过 剩余时间变化/成功提示 判断结果。
+    返回 (直接成功?, 模态框内出现的 renew 链接或 None, 备注)。"""
+    tag = _server_label(server_id)
+    try:
+        if "/dashboard" not in (page.url or ""):
+            safe_goto(page, f"{BASE_URL}/dashboard", timeout=20000)
+            page.wait_for_timeout(3000)
+
+        # Ad Blocker 拦截页检查 (与控制台同一套检测)
+        try:
+            gate_btn = page.locator('button:has-text("recheck"), button:has-text("disabled my adblocker")')
+            if gate_btn.count() > 0 and gate_btn.first.is_visible(timeout=2000):
+                log_warn(f"[{server_id}] dashboard 出现 Ad Blocker 拦截页, 点击重新验证解锁")
+                gate_btn.first.click(timeout=5000)
+                page.wait_for_timeout(6000)
+        except Exception:
+            pass
+
+        btn = page.locator('button:has-text("Renew Instance"), a:has-text("Renew Instance")').first
+        if btn.count() == 0:
+            log_info(f"[{server_id}] dashboard 无 Renew Instance 按钮 (可能仍处冷却期)")
+            return False, None, "无 Renew Instance 按钮"
+        try:
+            btn.dispatch_event("click")
+            log_info(f"[{server_id}] 已点击 Renew Instance (dispatch_event)")
+        except Exception:
+            btn.click(timeout=8000)
+            log_info(f"[{server_id}] 已点击 Renew Instance (常规点击)")
+        page.wait_for_timeout(4000)
+
+        # 模态框打开后重新扫描 /renew?id= 链接
+        m = page.evaluate(r"""() => {
+            for (const a of document.querySelectorAll('a[href*="renew?id="]')) {
+                const h = a.getAttribute('href');
+                if (h && h !== '#') return {href: h, text: 'Renew Instance'};
+            }
+            const mm = (document.body.innerHTML || '').match(/href=["']((?:\.\.)?\/renew\?id=[a-f0-9]{6,})["']/i);
+            return mm ? {href: mm[1], text: 'Renew Instance'} : null;
+        }""")
+        if m and m.get("href"):
+            log_info(f"[{server_id}] 点击 Renew Instance 后出现续期链接: {m['href'][:60]}")
+            return False, m, "modal-link"
+
+        # 无链接 → 找模态框确认按钮直接点
+        for sel in ('button:has-text("Confirm Renew")', 'button:has-text("Confirm")',
+                    'button:has-text("Renew Now")', 'button:has-text("Pay")',
+                    'button:has-text("Yes")', 'button:has-text("Continue")'):
+            try:
+                cb = page.locator(sel).last
+                if cb.count() == 0 or not cb.is_visible(timeout=1000):
+                    continue
+                t = (cb.inner_text() or "").strip()
+                if any(k in t.lower() for k in ("cancel", "close", "later", "no thanks", "delete")):
+                    continue
+                cb.dispatch_event("click")
+                log_info(f"[{server_id}] 已点击模态框确认按钮 '{t}' (dispatch_event)")
+                for _ in range(12):
+                    page.wait_for_timeout(2500)
+                    u = page.url or ""
+                    body = page.evaluate("() => document.body.innerText || ''") or ""
+                    left_now = normalize_left_text(body)
+                    if "success=RENEWED" in u or re.search(r"renewed|successfully renewed", body, re.I):
+                        return True, None, f"点击 '{t}' 后续期成功"
+                    if left_now:
+                        d = remaining_total_days(left_now) or 0
+                        if d > 8:
+                            return True, None, f"剩余时间变为 {left_now}, 续期成功"
+                    if re.search(r"not enough|insufficient", body, re.I):
+                        return False, None, "coins 不足, 续期被拒"
+                return False, None, f"点击 '{t}' 后未见成功/失败提示"
+            except Exception:
+                continue
+
+        # 诊断: dump 可见的 Renewal 模态框文本
+        try:
+            mtext = page.evaluate(r"""() => {
+                let best = '';
+                document.querySelectorAll('div, section').forEach(d => {
+                    const s = getComputedStyle(d);
+                    if (s.display === 'none' || s.visibility === 'hidden') return;
+                    const t = (d.innerText || '');
+                    if (/renew/i.test(t) && t.length < 800 && t.length > best.length) best = t;
+                });
+                return best.replace(/\s+/g, ' ').slice(0, 400);
+            }""")
+            if mtext:
+                log_info(f"[{server_id}] Renewal 模态框内容: {mtext}")
+        except Exception:
+            pass
+        return False, None, "模态框内无确认按钮也无续期链接"
+    except Exception as e:
+        log_warn(f"[{server_id}] dashboard 续期尝试异常: {e}")
+        return False, None, f"异常: {e}"
+
+
+def process_server(page, server_id: str, renew_links: dict | None = None, dashboard_left: str | None = None) -> dict:
     tag = _server_label(server_id)
     server_url = f"{BASE_URL}/server-console?id={server_id}"
     result = dict(server_id=server_id, status="unknown", before=None, after=None,
@@ -743,6 +899,10 @@ def process_server(page, server_id: str, renew_links: dict | None = None) -> dic
             }""")
             if status_text:
                 log_info(f"[{server_id}] 状态元素为空, 从页面文本解析: {status_text}")
+        if not status_text and dashboard_left:
+            # 控制台页已不显示剩余时间 (2026-09-27 实测), 用 dashboard 卡片上的 'Xd Yh left'
+            status_text = dashboard_left
+            log_info(f"[{server_id}] 控制台无状态文本, 采用 dashboard 剩余时间: {status_text}")
         log_info(f"[{server_id}] 续期状态: {status_text or '(空)'}")
 
         remaining_before = parse_remaining(status_text)
@@ -794,6 +954,18 @@ def process_server(page, server_id: str, renew_links: dict | None = None) -> dic
                 const m = document.body.innerHTML.match(/href=["']((?:\.\.)?\/renew\?id=[a-f0-9]+)["']/i);
                 return m ? {href:m[1], text:'html-extract'} : null;
             }""")
+
+        if not (renew_href and renew_href.get("href")):
+            # 新版站点: /renew?id= 链接不再静态生成, 续期入口改为 dashboard 上 "Renew Instance" 按钮
+            direct_ok, modal_link, note = try_dashboard_renew_modal(page, server_id)
+            if modal_link and modal_link.get("href"):
+                renew_href = modal_link
+            elif direct_ok:
+                result.update(status="renewed", emoji="✅", status_label="续期成功",
+                              detail=note or remaining_before or "")
+                return result
+            elif note:
+                log_warn(f"[{server_id}] dashboard 续期尝试未成功: {note}")
 
         if not (renew_href and renew_href.get("href")):
             # 诊断: 页面文本摘要 + 所有元素 ID + 续期相关元素, 便于定位 UI 改版/过期状态
@@ -1532,11 +1704,15 @@ def run():
             # dashboard 页面上提取每台服务器的续期链接 (剩余 <=7 天时才生成)
             renew_links = collect_renew_links(page)
 
+            # dashboard 卡片上的剩余时间 ('6d 5h left', 控制台页已不显示)
+            left_map, left_fallback = collect_dashboard_left(page)
+
             # ── 逐台处理 ─────────────────────────────────
             results, screenshots = [], []
             for sid in server_ids:
                 log_info("=" * 50)
-                res = process_server(page, sid, renew_links)
+                sid_left = left_map.get(sid) or (left_fallback[0] if left_fallback else None)
+                res = process_server(page, sid, renew_links, dashboard_left=sid_left)
                 results.append(res)
                 buf = take_screenshot(page, f"server-{_SERVER_INDEX.get(sid, 0)}")
                 if buf:
