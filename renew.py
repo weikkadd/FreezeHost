@@ -17,6 +17,22 @@ DISCORD_TOKEN = os.environ.get("FREEZEHOST_DISCORD_TOKEN", "").strip()
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID", "").strip()
 
+# 本地模式: 在用户本机用系统 Edge/Chrome + 持久化 profile 跑, 真实指纹过 Turnstile
+LOCAL_MODE    = os.environ.get("LOCAL_MODE", "").strip() == "1"
+USER_DATA_DIR = str(Path(__file__).with_name("browser_profile"))
+
+# 本地模式允许从脚本同目录 tg_local.txt 读 TG 配置 (第 1 行 bot token, 第 2 行 chat id)
+try:
+    if not (TG_BOT_TOKEN and TG_CHAT_ID):
+        _tg_file = Path(__file__).with_name("tg_local.txt")
+        if _tg_file.exists():
+            _lines = [l.strip() for l in _tg_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+            if len(_lines) >= 2:
+                TG_BOT_TOKEN = TG_BOT_TOKEN or _lines[0]
+                TG_CHAT_ID   = TG_CHAT_ID or _lines[1]
+except Exception:
+    pass
+
 # 代理配置 (复用 katabump 的 sing-box 方案)
 # IS_PROXY=true 时 PROXY_SERVER 形如 socks5://127.0.0.1:1080
 IS_PROXY      = os.environ.get("IS_PROXY", "false").lower() == "true"
@@ -1327,7 +1343,7 @@ def process_server(page, server_id: str, renew_links: dict | None = None, dashbo
 
 #  主流程
 def run():
-    if not DISCORD_TOKEN:
+    if not DISCORD_TOKEN and not LOCAL_MODE:
         raise RuntimeError("缺少 FREEZEHOST_DISCORD_TOKEN")
 
     # 启动浏览器 (可选 sing-box 代理, 复用 katabump 方案)
@@ -1380,24 +1396,56 @@ def run():
     }
 
     with sync_playwright() as pw:
-        # 尝试用 chrome channel, 失败回退到 chromium
-        try:
-            browser = pw.chromium.launch(**launch_kwargs)
-        except Exception as e:
-            log_warn(f"用 chrome channel 启动失败: {e}, 回退到 chromium")
-            launch_kwargs.pop("channel", None)
-            browser = pw.chromium.launch(**launch_kwargs)
-        # 用 storage_state 创建 context, 这样 discord.com 的 localStorage 会预写入 token
-        context = browser.new_context(
-            viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
-            storage_state=storage_state,
-            user_agent=REAL_UA,  # 强制 UA
-            locale="en-US",
-            timezone_id="America/New_York",
-        )
+        if LOCAL_MODE:
+            # 本地模式: 持久化 profile (首次手动登录后 session 长期有效), 系统 Edge/Chrome, 原生指纹
+            _lk = {
+                "headless": False,
+                "channel": "msedge",
+                "args": [
+                    "--disable-blink-features=AutomationControlled",  # navigator.webdriver=false
+                    "--window-size=1280,900",
+                    "--enable-gpu",
+                ],
+            }
+            context = None
+            for ch in ("msedge", "chrome", None):
+                try:
+                    if ch:
+                        _lk["channel"] = ch
+                    else:
+                        _lk.pop("channel", None)
+                    context = pw.chromium.launch_persistent_context(USER_DATA_DIR, **_lk)
+                    log_info(f"LOCAL 模式: 浏览器启动成功 (channel={ch or 'chromium'})")
+                    break
+                except Exception as e:
+                    log_warn(f"LOCAL 模式启动 channel={ch or 'chromium'} 失败: {e}")
+                    context = None
+            if context is None:
+                raise RuntimeError("LOCAL 模式无法启动浏览器 (需要系统已安装 Edge 或 Chrome)")
+            browser = context  # 统一走 finally 的 close
+        else:
+            # 尝试用 chrome channel, 失败回退到 chromium
+            try:
+                browser = pw.chromium.launch(**launch_kwargs)
+            except Exception as e:
+                log_warn(f"用 chrome channel 启动失败: {e}, 回退到 chromium")
+                launch_kwargs.pop("channel", None)
+                browser = pw.chromium.launch(**launch_kwargs)
+        if LOCAL_MODE:
+            pass  # context 已在上方创建 (持久化)
+        else:
+            # 用 storage_state 创建 context, 这样 discord.com 的 localStorage 会预写入 token
+            context = browser.new_context(
+                viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
+                storage_state=storage_state,
+                user_agent=REAL_UA,  # 强制 UA
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
         # 注入反检测脚本: 强制覆盖 UA + 隐藏 webdriver
         # 关键: FreezeHost 检测 userAgent_headless, 必须把 HeadlessChrome 改成 Chrome
-        context.add_init_script(f"""
+        # LOCAL 模式跳过: 真实浏览器 + 真实 IP, 保持原生指纹对 Turnstile 最友好
+        _init_js = f"""
             // 1. 强制覆盖 navigator.userAgent (最关键, FreezeHead 检测 userAgent_headless)
             try {{
                 Object.defineProperty(navigator, 'userAgent', {{
@@ -1502,7 +1550,9 @@ def run():
                     configurable: true
                 }});
             }} catch(e) {{}}
-        """)
+        """
+        if not LOCAL_MODE:
+            context.add_init_script(_init_js)
         page = context.new_page()
         page.set_default_timeout(TIMEOUT)
 
@@ -1579,6 +1629,17 @@ def run():
                 return   # Exit gracefully — not a script error
 
             # ── 已登录态直接跳过 OAuth ───────────────────
+            if LOCAL_MODE and not is_already_logged_in(page):
+                # 首次运行 (或 session 失效): 弹出的浏览器里由用户手动登录一次, 之后长期免登录
+                log_info("LOCAL 模式: 请在弹出的浏览器窗口中手动完成登录 (点 Login with Discord, 最多 5 分钟)...")
+                for _ in range(60):
+                    page.wait_for_timeout(5000)
+                    if is_already_logged_in(page):
+                        log_info("检测到已登录, 继续")
+                        break
+                else:
+                    log_warn("LOCAL 模式: 5 分钟内未检测到登录, 本次继续走自动登录流程")
+
             skipped_oauth = False
             if is_already_logged_in(page):
                 log_info(f"已是登录态, 跳过 OAuth 流程, 当前 URL: {page.url}")
@@ -2043,7 +2104,11 @@ def run():
                 context.close()
             except Exception:
                 pass
-            browser.close()
+            if browser is not context:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
