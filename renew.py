@@ -716,6 +716,21 @@ def process_server(page, server_id: str) -> dict:
             }""")
 
         if not (renew_href and renew_href.get("href")):
+            # 诊断: 页面文本摘要 + 所有元素 ID + 续期相关元素, 便于定位 UI 改版/过期状态
+            _diag = page.evaluate("""() => {
+                const out = { ids: [], renewEls: [], text: '' };
+                document.querySelectorAll('[id]').forEach(e => { if (e.id) out.ids.push(e.id); });
+                document.querySelectorAll('a, button').forEach(e => {
+                    const t = (e.innerText || '').trim();
+                    const h = e.getAttribute('href') || '';
+                    if (/renew|extend|续期|expired|expire/i.test(t + ' ' + h)) out.renewEls.push((t + ' ' + h).trim().slice(0, 80));
+                });
+                out.text = (document.body.innerText || '').replace(/\\s+/g, ' ').slice(0, 600);
+                return out;
+            }""")
+            log_warn(f"[{server_id}] 页面元素 ID: {_diag.get('ids', [])[:20]}")
+            log_warn(f"[{server_id}] 续期相关元素: {_diag.get('renewEls', [])[:8]}")
+            log_warn(f"[{server_id}] 页面文本摘要: {_diag.get('text', '')}")
             raise RuntimeError("未找到续期链接")
 
         btn_text = renew_href.get("text", "")
