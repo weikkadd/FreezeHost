@@ -1245,7 +1245,31 @@ def process_server(page, server_id: str, renew_links: dict | None = None, dashbo
                     }""") or ""
                     if token:
                         break
+                # managed 模式下有时需要点一下复选框才出 token; 用真实鼠标事件点击 iframe 中心
+                if not token:
+                    try:
+                        w = page.locator('iframe[src*="challenges.cloudflare.com"]').first
+                        if w.count():
+                            bb = w.bounding_box()
+                            if bb:
+                                page.mouse.click(bb["x"] + bb["width"] / 2, bb["y"] + bb["height"] / 2)
+                                log_info(f"[{server_id}] 已点击 Turnstile widget 中心 (真实鼠标事件)")
+                    except Exception as e:
+                        log_warn(f"[{server_id}] Turnstile 点击尝试失败: {e}")
+                    for _ in range(6):
+                        page.wait_for_timeout(3000)
+                        token = page.evaluate(r"""() => {
+                            const i = document.querySelector('input[name="cf-turnstile-response"]');
+                            return i ? (i.value || '') : '';
+                        }""") or ""
+                        if token:
+                            break
                 log_info(f"[{server_id}] Turnstile token: {'已获取 (' + str(len(token)) + ' 字符)' if token else '未获取 (无法自动过盾)'}")
+                if not token:
+                    log_warn(f"[{server_id}] Cloudflare Turnstile 无法自动通过, 转为请求人工续期")
+                    result.update(status="manual", emoji="🙋", status_label="需人工续期",
+                                  detail=f"Turnstile 人机验证未通过, 请登录面板手动续期: dashboard → Renew Instance (20 Coins, 剩余 {remaining_before or '?'})")
+                    return result
                 # ③ 点完成按钮 (token 到位后按钮才会解锁)
                 done = page.evaluate(r"""() => {
                     for (const e of document.querySelectorAll('button, a, [role=button]')) {
@@ -1995,7 +2019,7 @@ def run():
 
             # ── TG 推送（带 emoji 格式） ──────
             # 固定每日运行后: 纯冷却期不再推送 (免得每天刷屏), 只推送有动作/异常的结果
-            actionable = [r for r in results if r.get("status") in ("renewed", "error", "broke", "unknown")]
+            actionable = [r for r in results if r.get("status") in ("renewed", "error", "broke", "unknown", "manual")]
             if not actionable:
                 summary = "; ".join(f"{r['server_id']}:{r['status']}({r.get('detail', '')})" for r in results)
                 log_info(f"全部服务器处于冷却期, 跳过 TG 推送: {summary}")
