@@ -1241,6 +1241,41 @@ def run():
                 page.context.remove_listener("page", _on_popup)
 
                 if discord_page is None and not auto_done:
+                    # ── 兜底: 直接访问 /login ──────────────────────────
+                    # 站点首页源码证实: "Login with Discord" 按钮只是打开服务条款模态框,
+                    # 模态框里 "Accept & Login" 的全部逻辑就是 window.location.href='../login'。
+                    # 若 dispatch 点击因监听器尚未挂载(慢 runner 上脚本草执行的竞态)/
+                    # 元素被广告脚本重渲染而无效, 直接 goto /login 与手动确认完全等价。
+                    try:
+                        log_warn("点击登录按钮未产生任何跳转, 直接访问 /login (等价于 Accept & Login 按钮)...")
+                        page.goto(BASE_URL.rstrip("/") + "/login",
+                                  wait_until="domcontentloaded", timeout=30000)
+                    except Exception as e:
+                        log_warn(f"直接访问 /login 异常: {e}")
+                    for _ in range(15):
+                        u = _safe_url(page)
+                        if u:
+                            seen_urls.add(u)
+                        if u.startswith("https://discord.com/") or u.startswith("https://discordapp.com/"):
+                            discord_page = page
+                            break
+                        if "/dashboard" in u or "/callback" in u or "/submitlogin" in u:
+                            auto_done = True
+                            discord_page = page
+                            break
+                        for np in list(page.context.pages):
+                            nu = _safe_url(np)
+                            if nu and (nu.startswith("https://discord.com/")
+                                       or nu.startswith("https://discordapp.com/")):
+                                discord_page = np
+                                break
+                        if discord_page is not None:
+                            break
+                        page.wait_for_timeout(1000)
+                    if discord_page is not None or auto_done:
+                        log_info(f"直接访问 /login 成功进入 OAuth 流程, URL: {_safe_url(discord_page or page)}")
+
+                if discord_page is None and not auto_done:
                     # 诊断信息: 所有页面 URL / 出现过的 URL / 是否有 Turnstile 人机验证
                     diag_lines = [f"打开的页面数: {len(page.context.pages)}, 已关闭广告弹窗: {ads_closed}"]
                     for p in page.context.pages:
@@ -1253,15 +1288,25 @@ def run():
                             diag_lines.append("  ⚠️ 检测到 Cloudflare Turnstile 人机验证, Actions 无法自动过盾")
                     except Exception:
                         pass
+                    try:
+                        diag_lines.append(
+                            f"  页面结构: #login-btn={'有' if page.locator('#login-btn').count() else '无'}"
+                            f" #login-modal={'有' if page.locator('#login-modal').count() else '无'}"
+                            f" (无变化=点击无效, 有变化=页面改版)"
+                        )
+                    except Exception:
+                        pass
                     _diag = "\n".join(diag_lines)[:1500]
                     log_error(_diag)
                     buf = take_screenshot(page, "not-discord")
                     current_url = _safe_url(page)
                     send_tg(
                         f"用户：{display_name}\n"
-                        f"❌ 点击登录后未跳转到 Discord\n"
+                        f"❌ 点击登录后未跳转到 Discord (直接访问 /login 兜底也失败)\n"
                         f"当前 URL: {current_url}\n"
                         f"{_diag}\n"
+                        f"⚠️ 点击与直接 /login 均无反应, 疑似当前出口 IP 被站点静默拒绝"
+                        f"(与机房代理时代症状相同), 建议手动 Re-run 换出口 IP\n"
                         f"\nFreezeHost Auto Renew",
                         buf,
                     )
